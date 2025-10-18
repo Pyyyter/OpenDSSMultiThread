@@ -1,0 +1,15 @@
+!DEFINICAO DA CARGA
+
+!a)Perfil de carga diaria: 
+
+	New loadshape.carga_dia 24 mult=(file=Cargas_RJ.txt) action=normalize
+	
+!---------------------------------------------------------------------------------------------------------------------------------	
+
+!b)Definicao dos objetos load: 
+
+	New load.CargaA    Phases=1   model=1 bus1=barra2.1   kV=7.97  kW=20    pf=0.95   vmaxpu=1.2   vminpu=0.75     daily=carga_dia  
+	New load.CargaB    Phases=1   model=1 bus1=barra2.2   kV=7.97 kW=22    pf=0.95   vmaxpu=1.2   vminpu=0.75     daily=carga_dia
+	New load.CargaC    Phases=1   model=1 bus1=barra2.3   kV=7.97 kW=23    pf=0.95   vmaxpu=1.2   vminpu=0.75     daily=carga_dia
+
+	
