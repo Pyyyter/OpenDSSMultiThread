@@ -9,21 +9,17 @@ import tempfile
 import zipfile
 from shutil import copyfileobj
 
-st.set_page_config(page_title="My Landing Page", page_icon="🌐", layout="wide")
+st.set_page_config(page_title="OpenDSS MultiThread", page_icon="🌐", layout="wide")
 
-# Hero section
-with st.container():
-    st.title("Welcome to OpenDSS MultiThread")
-    st.write(
-        """
-        Accelerate your power system simulations with a modern, multi-threaded workflow.
-        Explore features, documentation, and get started in minutes.
-        """
-    )
-    col1, col2 = st.columns([1, 1])
-    with col1:
+header_col, action_col = st.columns([3, 2])
+with header_col:
+    st.header("OpenDSS MultiThread")
+    st.caption("Accelerate your power system simulations with a modern, multi-threaded workflow.")
+with action_col:
+    btn_col1, btn_col2 = st.columns(2)
+    with btn_col1:
         st.link_button("Get Started", "https://github.com/pyyyt/OpenDSSMultiThread")
-    with col2:
+    with btn_col2:
         st.link_button("Documentation", "https://github.com/pyyyt/OpenDSSMultiThread/wiki")
 
 st.markdown("---")
@@ -73,6 +69,7 @@ for idx, (title, desc) in enumerate(features.items()):
                 extracted = [str(p.relative_to(extract_dir)) for p in extract_dir.rglob("*")]
 
                 st.success(f"Files extracted to {extract_dir}")
+                st.session_state["pending_extract_dir"] = str(extract_dir)
                 st.write(extracted)
                 dss_files = sorted(str(p.relative_to(extract_dir)) for p in extract_dir.rglob("*.dss"))
                 if dss_files:
@@ -86,14 +83,15 @@ for idx, (title, desc) in enumerate(features.items()):
                     main_file = None
                 monitor_name = st.text_input("Nome do monitor a ser retornado", key=f"monitor_name_{idx}")
                 if st.button("Ir para a página de carregamento", key=f"redirect_loading_{idx}"):
-                    if main_file and monitor_name:
-                        st.session_state["pending_main_file"] = main_file
-                        st.session_state["pending_monitor_name"] = monitor_name
-                        st.session_state["pending_extract_dir"] = str(extract_dir)
-                        st.switch_page("pages/loading.py")
-                    else:
-                        st.warning("Preencha os campos antes de continuar.")
-
+                    try:
+                        if main_file and monitor_name:
+                            st.session_state["pending_main_file"] = main_file
+                            st.session_state["pending_monitor_name"] = monitor_name
+                            st.switch_page("loading")
+                        else:
+                            raise ValueError("Preencha todos os dados antes de continuar.")
+                    except Exception as exc:
+                        st.error(f"Erro : {exc}")
             except Exception as exc:
                 st.error(f"Extraction failed: {exc}")
                 
