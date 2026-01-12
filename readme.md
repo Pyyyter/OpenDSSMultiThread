@@ -46,7 +46,7 @@ pip install -r src/requirements.txt
 2. Configure o ambiente.
 3. Execute:
     ```bash
-    python -m streamlit src/pages/app.py
+    python -m streamlit run src/app.py
     ```
 
 ## 🧪 Testes

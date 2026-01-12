@@ -1,0 +1,35 @@
+!_________________________________________________________________________________________________________________________________
+
+!PARAMETROS DO MODELO PVSYSTEM:
+
+!a) P-TCurve: Fator de correção da potência dos módulos FVs (pu na base de Pmpp) 
+!	em função da temperatura (unidade de temperatura) 
+
+	New XYCurve.MyPvsT npts=4 xarray=[0 25 75 100] yarray=[1.2 1.0 0.8 0.6]
+	
+!---------------------------------------------------------------------------------------------------------------------------------		
+!b) effcurve: Curva da Eficiencia (pu) X Potência do Inversor (pu), que é o parâmetro kVA
+
+	New XYCurve.MyEff npts=4 xarray=[.1 .2 .4 1.0] yarray=[.86 .9 .93 .97]
+	
+!---------------------------------------------------------------------------------------------------------------------------------		
+!c) Daily: Curva diaria da irradiancia (pu) X tempo (h)
+
+	New Loadshape.MyIrrad npts=24 interval=1 mult=[0 0 0 0 0 0 .1 .2 .3 .5 .8 .9 1.0 1.0 .99 .9 .7 .4 .1 0 0 0 0 0]
+	
+!---------------------------------------------------------------------------------------------------------------------------------	
+!d) TDaily: Curva diaria da temperatura (unidade de temperatura) X tempo (h)	
+
+	New Tshape.MyTemp npts=24 interval=1 temp=[25, 25, 25, 25, 25, 25, 25, 25, 35, 40, 45, 50  60 60  55 40  35  30  25 25 25 25 25 25]
+	
+!_________________________________________________________________________________________________________________________________
+
+!DEFINICAO DO MODELO PVSYSTEM
+
+	New PVSystem.PV phases=3 bus1=barra2 kV=13.8  
+	~ irrad=1 kVA=20 Pmpp=20 !temperature=25
+	~  PF=1 effcurve=Myeff P-TCurve=MyPvsT
+	~ Daily=MyIrrad TDaily=MyTemp
+	!~ %cutin=50 %cutout=50
+
+!_________________________________________________________________________________________________________________________________
