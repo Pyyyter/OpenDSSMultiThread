@@ -1,6 +1,7 @@
 import streamlit as st
 from pathlib import Path
 import json
+from io import BytesIO
 import random
 import re
 import shutil
@@ -9,12 +10,23 @@ import sys
 import tempfile
 import time
 import os
+import zipfile
 
 import opendssdirect as dss
 
 SOLVER = "OpenDSS"
 
 NUMERIC_PATTERN = re.compile(r"(?i)([a-z][\w%]*)\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
+
+
+def zip_directory_to_bytes(dir_path: Path) -> bytes:
+    """Compress a directory into an in-memory zip for download."""
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for file in dir_path.rglob("*"):
+            if file.is_file():
+                zf.write(file, arcname=file.relative_to(dir_path))
+    return buffer.getvalue()
 
 def solveFile(solver, path):
     # Ensure a clean state before each run
@@ -78,11 +90,12 @@ def replace_line_value(text: str, selection: dict, rng: random.Random) -> str:
     return "\n".join(lines)
 
 
-def apply_randomizations_for_file(file_path: Path, selections: list, scenario_idx: int):
+def apply_randomizations_for_file(file_path: Path, selections: list, scenario_idx: int, base_seed: int | None = None):
     if not selections:
         return
     text = file_path.read_text(encoding="utf-8", errors="ignore")
-    rng = random.Random(f"{file_path}-{scenario_idx}")
+    seed_material = f"{file_path}-{scenario_idx}-{base_seed}" if base_seed is not None else f"{file_path}-{scenario_idx}"
+    rng = random.Random(seed_material)
     for selection in selections:
         if selection.get("kind") == "line_value":
             text = replace_line_value(text, selection, rng)
@@ -91,7 +104,7 @@ def apply_randomizations_for_file(file_path: Path, selections: list, scenario_id
     file_path.write_text(text, encoding="utf-8")
 
 
-def prepare_randomized_dir(extract_dir: Path, selections: list, scenario_idx: int) -> Path:
+def prepare_randomized_dir(extract_dir: Path, selections: list, scenario_idx: int, base_seed: int | None = None) -> Path:
     scenario_dir = Path(tempfile.mkdtemp(prefix=f"scenario_{scenario_idx}_"))
     shutil.copytree(extract_dir, scenario_dir, dirs_exist_ok=True)
 
@@ -102,13 +115,13 @@ def prepare_randomized_dir(extract_dir: Path, selections: list, scenario_idx: in
     for rel_path, vars_for_file in grouped.items():
         target = scenario_dir / rel_path
         if target.exists():
-            apply_randomizations_for_file(target, vars_for_file, scenario_idx)
+            apply_randomizations_for_file(target, vars_for_file, scenario_idx, base_seed)
 
     return scenario_dir
 
 
-def run_single_case(case_index: int, extract_dir: str, main_file: str, monitor_name: str, selections: list):
-    scenario_dir = prepare_randomized_dir(Path(extract_dir), selections, case_index)
+def run_single_case(case_index: int, extract_dir: str, main_file: str, monitor_name: str, selections: list, base_seed: int | None = None):
+    scenario_dir = prepare_randomized_dir(Path(extract_dir), selections, case_index, base_seed)
     main_path = scenario_dir / main_file
 
     # Run in isolated Python process to avoid OpenDSS reentrancy issues.
@@ -160,7 +173,7 @@ def run_single_case(case_index: int, extract_dir: str, main_file: str, monitor_n
     }
 
 
-def run_cases_parallel(case_count: int, extract_dir: str, main_file: str, monitor_name: str, selections: list):
+def run_cases_parallel(case_count: int, extract_dir: str, main_file: str, monitor_name: str, selections: list, base_seed: int | None = None):
     # Thread pool only orchestrates subprocesses; OpenDSS runs per-process.
     results = []
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -170,7 +183,7 @@ def run_cases_parallel(case_count: int, extract_dir: str, main_file: str, monito
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(run_single_case, idx + 1, extract_dir, main_file, monitor_name, selections): idx + 1
+            executor.submit(run_single_case, idx + 1, extract_dir, main_file, monitor_name, selections, base_seed): idx + 1
             for idx in range(case_count)
         }
         for future in as_completed(futures):
@@ -199,6 +212,9 @@ extract_dir = st.session_state["pending_extract_dir"]
 random_plan = st.session_state.get("pending_random_plan", [])
 case_count = int(st.session_state.get("pending_case_count", 1))
 
+# Unique seed per run to avoid identical randomizations across executions
+run_seed = random.SystemRandom().getrandbits(64)
+
 if not all([main_file, monitor_name, extract_dir]):
     st.warning("Dados pendentes não encontrados. Volte para a página inicial.")
     st.stop()
@@ -221,6 +237,7 @@ with st.spinner("Gerando casos randomizados e executando no OpenDSS..."):
         main_file=main_file,
         monitor_name=monitor_name,
         selections=random_plan,
+        base_seed=run_seed,
     )
     duration = time.perf_counter() - start
 
@@ -236,6 +253,17 @@ for result in results:
         continue
     st.dataframe({"valor": result.get("data", [])})
     st.caption(f"Monitores disponíveis: {', '.join(result.get('monitors', []))}")
+    scenario_dir = result.get("scenario_dir")
+    if scenario_dir and Path(scenario_dir).exists():
+        st.caption(f"Pasta do cenário: {scenario_dir}")
+        zip_bytes = zip_directory_to_bytes(Path(scenario_dir))
+        st.download_button(
+            "Baixar pasta randomizada (.zip)",
+            data=zip_bytes,
+            file_name=f"cenario_{result.get('case')}_randomizado.zip",
+            mime="application/zip",
+            key=f"zip_case_{result.get('case')}",
+        )
 
 st.success("Processamento concluído.")
 st.info(f"Tempo total: {duration:.2f} segundos | Workers usados: {workers_used}")
