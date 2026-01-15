@@ -193,6 +193,22 @@ def run_cases_parallel(case_count: int, extract_dir: str, main_file: str, monito
                 results.append({"case": futures[future], "data": None, "monitors": [], "error": str(exc)})
     return sorted(results, key=lambda x: x.get("case", 0)), max_workers
 
+
+def run_cases_serial(case_count: int, extract_dir: str, main_file: str, monitor_name: str, selections: list, base_seed: int | None = None):
+    results = []
+    for idx in range(case_count):
+        results.append(
+            run_single_case(
+                case_index=idx + 1,
+                extract_dir=extract_dir,
+                main_file=main_file,
+                monitor_name=monitor_name,
+                selections=selections,
+                base_seed=base_seed,
+            )
+        )
+    return results, 1
+
 st.set_page_config(page_title="Carregando", page_icon="⏳")
 
 DEFAULT_SESSION_STATE = {
@@ -229,17 +245,44 @@ st.write(f"- Nome do monitor: {monitor_name}")
 st.write(f"- Diretório extraído: {extract_dir}")
 st.write(f"- Casos em paralelo: {case_count}")
 
+benchmark_mode = st.checkbox("Modo benchmark (executar série + paralelo)")
+
 with st.spinner("Gerando casos randomizados e executando no OpenDSS..."):
-    start = time.perf_counter()
-    results, workers_used = run_cases_parallel(
-        case_count=case_count,
-        extract_dir=extract_dir,
-        main_file=main_file,
-        monitor_name=monitor_name,
-        selections=random_plan,
-        base_seed=run_seed,
-    )
-    duration = time.perf_counter() - start
+    if benchmark_mode:
+        serial_start = time.perf_counter()
+        _, serial_workers = run_cases_serial(
+            case_count=case_count,
+            extract_dir=extract_dir,
+            main_file=main_file,
+            monitor_name=monitor_name,
+            selections=random_plan,
+            base_seed=run_seed,
+        )
+        serial_duration = time.perf_counter() - serial_start
+
+        parallel_start = time.perf_counter()
+        results, workers_used = run_cases_parallel(
+            case_count=case_count,
+            extract_dir=extract_dir,
+            main_file=main_file,
+            monitor_name=monitor_name,
+            selections=random_plan,
+            base_seed=run_seed,
+        )
+        parallel_duration = time.perf_counter() - parallel_start
+    else:
+        start = time.perf_counter()
+        results, workers_used = run_cases_parallel(
+            case_count=case_count,
+            extract_dir=extract_dir,
+            main_file=main_file,
+            monitor_name=monitor_name,
+            selections=random_plan,
+            base_seed=run_seed,
+        )
+        parallel_duration = time.perf_counter() - start
+        serial_duration = None
+        serial_workers = None
 
 st.session_state["solver_result"] = results
 
@@ -266,4 +309,13 @@ for result in results:
         )
 
 st.success("Processamento concluído.")
-st.info(f"Tempo total: {duration:.2f} segundos | Workers usados: {workers_used}")
+
+if benchmark_mode and serial_duration is not None:
+    gain_pct = ((serial_duration - parallel_duration) / serial_duration * 100) if serial_duration else 0.0
+    st.info(
+        f"Tempo sem paralelismo: {serial_duration:.2f} s (workers: {serial_workers}) | "
+        f"Tempo com paralelismo: {parallel_duration:.2f} s (workers: {workers_used}) | "
+        f"Ganho: {gain_pct:.1f}%"
+    )
+else:
+    st.info(f"Tempo total: {parallel_duration:.2f} segundos | Workers usados: {workers_used}")
