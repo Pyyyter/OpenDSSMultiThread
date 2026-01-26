@@ -120,7 +120,23 @@ def prepare_randomized_dir(extract_dir: Path, selections: list, scenario_idx: in
     return scenario_dir
 
 
-def run_single_case(case_index: int, extract_dir: str, main_file: str, monitor_name: str, selections: list, base_seed: int | None = None):
+def pick_monitor_values(data_map: dict, monitor_name: str):
+    if not isinstance(data_map, dict):
+        return None
+    for key, vals in data_map.items():
+        if str(key).lower() == monitor_name.lower():
+            return vals
+    return None
+
+
+def run_single_case(
+    case_index: int,
+    extract_dir: str,
+    main_file: str,
+    monitor_names: list[str],
+    selections: list,
+    base_seed: int | None = None,
+):
     scenario_dir = prepare_randomized_dir(Path(extract_dir), selections, case_index, base_seed)
     main_path = scenario_dir / main_file
 
@@ -131,9 +147,9 @@ def run_single_case(case_index: int, extract_dir: str, main_file: str, monitor_n
         str(worker_path),
         "--main",
         str(main_path),
-        "--monitor",
-        monitor_name,
     ]
+    if monitor_names:
+        cmd.extend(["--monitors", json.dumps(monitor_names)])
     completed = subprocess.run(cmd, capture_output=True, text=True, cwd=worker_path.parent.parent)
     if completed.returncode != 0:
         return {
@@ -173,7 +189,7 @@ def run_single_case(case_index: int, extract_dir: str, main_file: str, monitor_n
     }
 
 
-def run_cases_parallel(case_count: int, extract_dir: str, main_file: str, monitor_name: str, selections: list, base_seed: int | None = None):
+def run_cases_parallel(case_count: int, extract_dir: str, main_file: str, monitor_names: list[str], selections: list, base_seed: int | None = None):
     # Thread pool only orchestrates subprocesses; OpenDSS runs per-process.
     results = []
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -183,7 +199,15 @@ def run_cases_parallel(case_count: int, extract_dir: str, main_file: str, monito
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(run_single_case, idx + 1, extract_dir, main_file, monitor_name, selections, base_seed): idx + 1
+            executor.submit(
+                run_single_case,
+                idx + 1,
+                extract_dir,
+                main_file,
+                monitor_names,
+                selections,
+                base_seed,
+            ): idx + 1
             for idx in range(case_count)
         }
         for future in as_completed(futures):
@@ -194,7 +218,7 @@ def run_cases_parallel(case_count: int, extract_dir: str, main_file: str, monito
     return sorted(results, key=lambda x: x.get("case", 0)), max_workers
 
 
-def run_cases_serial(case_count: int, extract_dir: str, main_file: str, monitor_name: str, selections: list, base_seed: int | None = None):
+def run_cases_serial(case_count: int, extract_dir: str, main_file: str, monitor_names: list[str], selections: list, base_seed: int | None = None):
     results = []
     for idx in range(case_count):
         results.append(
@@ -202,7 +226,7 @@ def run_cases_serial(case_count: int, extract_dir: str, main_file: str, monitor_
                 case_index=idx + 1,
                 extract_dir=extract_dir,
                 main_file=main_file,
-                monitor_name=monitor_name,
+                monitor_names=monitor_names,
                 selections=selections,
                 base_seed=base_seed,
             )
@@ -213,25 +237,27 @@ st.set_page_config(page_title="Carregando", page_icon="⏳")
 
 DEFAULT_SESSION_STATE = {
     "pending_main_file": None,
-    "pending_monitor_name": None,
     "pending_extract_dir": None,
     "pending_random_plan": [],
     "pending_case_count": 1,
+    "pending_selected_monitors": [],
+    "pending_monitor_offsets": {},
 }
 
 for key, default in DEFAULT_SESSION_STATE.items():
     st.session_state.setdefault(key, default)
 
 main_file = st.session_state["pending_main_file"]
-monitor_name = st.session_state["pending_monitor_name"]
 extract_dir = st.session_state["pending_extract_dir"]
 random_plan = st.session_state.get("pending_random_plan", [])
 case_count = int(st.session_state.get("pending_case_count", 1))
+stored_selected_monitors = st.session_state.get("pending_selected_monitors", [])
+stored_monitor_offsets = st.session_state.get("pending_monitor_offsets", {})
 
 # Unique seed per run to avoid identical randomizations across executions
 run_seed = random.SystemRandom().getrandbits(64)
 
-if not all([main_file, monitor_name, extract_dir]):
+if not all([main_file, extract_dir]):
     st.warning("Dados pendentes não encontrados. Volte para a página inicial.")
     st.stop()
 
@@ -241,11 +267,44 @@ if not random_plan:
 
 st.write("Carregando...")
 st.write(f"- Arquivo principal: {main_file}")
-st.write(f"- Nome do monitor: {monitor_name}")
 st.write(f"- Diretório extraído: {extract_dir}")
 st.write(f"- Casos em paralelo: {case_count}")
 
 benchmark_mode = st.checkbox("Modo benchmark (executar série + paralelo)")
+
+main_path = Path(extract_dir) / main_file
+available_monitors = run_solver_with_monitor(SOLVER, str(main_path), monitor_name=None)
+
+st.subheader("Selecione os monitores a acompanhar")
+if not available_monitors:
+    st.warning("Nenhum monitor encontrado no circuito carregado.")
+    st.stop()
+
+selected_monitors = st.multiselect(
+    "Monitores disponíveis",
+    options=available_monitors,
+    default=stored_selected_monitors or available_monitors,
+)
+
+monitor_offsets: dict[str, float] = {}
+for monitor in selected_monitors:
+    monitor_offsets[monitor] = st.number_input(
+        f"Offset máximo permitido para {monitor}",
+        min_value=0.0,
+        value=float(stored_monitor_offsets.get(monitor, 0.0)),
+        key=f"offset_{monitor}",
+        help="Se qualquer valor do monitor exceder este limite, o cenário é contado como estouro.",
+    )
+
+if not selected_monitors:
+    st.warning("Selecione pelo menos um monitor para continuar.")
+    st.stop()
+
+if st.button("Executar simulações", type="primary"):
+    st.session_state["pending_selected_monitors"] = selected_monitors
+    st.session_state["pending_monitor_offsets"] = monitor_offsets
+else:
+    st.stop()
 
 with st.spinner("Gerando casos randomizados e executando no OpenDSS..."):
     if benchmark_mode:
@@ -254,7 +313,7 @@ with st.spinner("Gerando casos randomizados e executando no OpenDSS..."):
             case_count=case_count,
             extract_dir=extract_dir,
             main_file=main_file,
-            monitor_name=monitor_name,
+            monitor_names=selected_monitors,
             selections=random_plan,
             base_seed=run_seed,
         )
@@ -265,7 +324,7 @@ with st.spinner("Gerando casos randomizados e executando no OpenDSS..."):
             case_count=case_count,
             extract_dir=extract_dir,
             main_file=main_file,
-            monitor_name=monitor_name,
+            monitor_names=selected_monitors,
             selections=random_plan,
             base_seed=run_seed,
         )
@@ -276,7 +335,7 @@ with st.spinner("Gerando casos randomizados e executando no OpenDSS..."):
             case_count=case_count,
             extract_dir=extract_dir,
             main_file=main_file,
-            monitor_name=monitor_name,
+            monitor_names=selected_monitors,
             selections=random_plan,
             base_seed=run_seed,
         )
@@ -286,15 +345,24 @@ with st.spinner("Gerando casos randomizados e executando no OpenDSS..."):
 
 st.session_state["solver_result"] = results
 
+overflow_counts = {m: 0 for m in selected_monitors}
+
 for result in results:
     st.markdown(f"### Cenário {result.get('case')}")
     if result.get("error"):
         st.error(f"Falha ao executar: {result['error']}")
         continue
-    if result.get("data") is None:
-        st.warning("Monitor não encontrado para este cenário.")
-        continue
-    st.dataframe({"valor": result.get("data", [])})
+    data_map = result.get("data") or {}
+    for monitor in selected_monitors:
+        values = pick_monitor_values(data_map, monitor)
+        if values is None:
+            st.warning(f"Monitor {monitor} não retornou dados neste cenário.")
+            continue
+        st.write(f"Monitor: {monitor}")
+        st.dataframe({"valor": values})
+        offset = monitor_offsets.get(monitor, 0.0)
+        if offset > 0 and any(abs(v) > offset for v in values):
+            overflow_counts[monitor] += 1
     st.caption(f"Monitores disponíveis: {', '.join(result.get('monitors', []))}")
     scenario_dir = result.get("scenario_dir")
     if scenario_dir and Path(scenario_dir).exists():
@@ -319,3 +387,8 @@ if benchmark_mode and serial_duration is not None:
     )
 else:
     st.info(f"Tempo total: {parallel_duration:.2f} segundos | Workers usados: {workers_used}")
+
+st.subheader("Estouro de offset por monitor")
+for monitor in selected_monitors:
+    count = overflow_counts.get(monitor, 0)
+    st.metric(label=monitor, value=f"{count} / {case_count}", help="Cenários em que o valor ultrapassou o offset definido.")

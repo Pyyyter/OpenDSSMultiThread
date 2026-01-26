@@ -19,30 +19,42 @@ def to_serializable(obj: Any):
     return obj
 
 
-def solve(main_path: str, monitor_name: str):
+def solve(main_path: str, monitor_names: list[str] | None):
     dss.Basic.ClearAll()
     dss.Text.Command(f"redirect {main_path}")
     dss.Monitors.SaveAll()
     monitors = dss.Monitors.AllNames()
-    target = None
-    for name in monitors:
-        if name.lower() == monitor_name.lower():
-            dss.Monitors.Name(name)
-            target = dss.Monitors.Channel(1)
-            break
+    data = {}
+    if monitor_names:
+        targets = {m.lower() for m in monitor_names}
+        for name in monitors:
+            if name.lower() in targets:
+                dss.Monitors.Name(name)
+                data[name] = to_serializable(dss.Monitors.Channel(1))
     return {
         "monitors": to_serializable(monitors),
-        "data": to_serializable(target),
+        "data": data,
     }
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--main", required=True)
-    parser.add_argument("--monitor", required=True)
+    parser.add_argument("--monitor")
+    parser.add_argument("--monitors", help="JSON list of monitor names")
     args = parser.parse_args(argv)
     try:
-        result = solve(args.main, args.monitor)
+        monitors = None
+        if args.monitors:
+            try:
+                import json
+
+                monitors = json.loads(args.monitors)
+            except Exception:
+                monitors = None
+        if not monitors and args.monitor:
+            monitors = [args.monitor]
+        result = solve(args.main, monitors or [])
         print(json.dumps({"ok": True, "result": result}))
     except Exception as exc:  # pragma: no cover
         print(json.dumps({"ok": False, "error": str(exc)}))

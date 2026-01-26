@@ -15,7 +15,6 @@ st.set_page_config(page_title="OpenDSS MultiThread", page_icon="🌐", layout="w
 
 DEFAULT_SESSION_STATE = {
     "pending_main_file": None,
-    "pending_monitor_name": None,
     "pending_extract_dir": None,
     "pending_random_plan": [],
     "pending_case_count": 3,
@@ -164,10 +163,6 @@ for idx, (title, desc) in enumerate(features.items()):
                     st.warning("Nenhum arquivo .dss encontrado no diretório extraído.")
                     main_file = None
 
-                monitor_name = st.text_input(
-                    "Nome do monitor a ser retornado", key=f"monitor_name_{idx}"
-                )
-
                 if extract_dir:
                     if st.session_state.get("parsed_variables_dir") != str(extract_dir):
                         st.session_state["parsed_variables"] = parse_numeric_variables(extract_dir)
@@ -222,13 +217,12 @@ for idx, (title, desc) in enumerate(features.items()):
 
                     if st.button("Gerar casos e carregar", key=f"redirect_loading_{idx}"):
                         try:
-                            if not main_file or not monitor_name:
-                                raise ValueError("Preencha o arquivo principal e o monitor.")
+                            if not main_file:
+                                raise ValueError("Preencha o arquivo principal.")
                             if not selected_plan:
                                 raise ValueError("Selecione pelo menos uma variável para randomizar.")
 
                             st.session_state["pending_main_file"] = main_file
-                            st.session_state["pending_monitor_name"] = monitor_name
                             st.session_state["pending_extract_dir"] = str(extract_dir)
                             st.session_state["pending_random_plan"] = selected_plan
                             st.session_state["pending_case_count"] = int(case_count)
