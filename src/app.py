@@ -34,6 +34,7 @@ def parse_file_variables(path: Path, root: Path):
     """Extract numeric parameters from DSS/TXT files so the user can randomize them."""
     text = path.read_text(encoding="utf-8", errors="ignore")
     variables = []
+    per_key_occurrence = defaultdict(int)  # track occurrence per key so replacements align
 
     if path.suffix.lower() == ".txt":
         for idx, raw in enumerate(text.splitlines(), start=1):
@@ -64,6 +65,8 @@ def parse_file_variables(path: Path, root: Path):
         except ValueError:
             continue
         line = text.count("\n", 0, match.start()) + 1
+        occurrence = per_key_occurrence[key]
+        per_key_occurrence[key] += 1
         variables.append(
             {
                 "id": f"kv-{idx}",
@@ -71,7 +74,7 @@ def parse_file_variables(path: Path, root: Path):
                 "value": value,
                 "line": line,
                 "kind": "key_value",
-                "match_index": idx,
+                "match_index": occurrence,
                 "relative_path": str(path.relative_to(root)),
             }
         )
@@ -187,7 +190,6 @@ for idx, (title, desc) in enumerate(features.items()):
                     case_count = st.number_input(
                         "Quantos casos paralelos você quer rodar?",
                         min_value=1,
-                        max_value=200,
                         value=st.session_state.get("pending_case_count", 3),
                         help="Cada cenário roda em um subprocesso isolado; aumente conforme sua CPU/tempo suportar.",
                         key=f"case_count_{idx}",
