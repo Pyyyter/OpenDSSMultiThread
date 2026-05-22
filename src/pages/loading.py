@@ -12,10 +12,6 @@ import time
 import os
 import zipfile
 
-import opendssdirect as dss
-
-SOLVER = "OpenDSS"
-
 NUMERIC_PATTERN = re.compile(r"(?i)([a-z][\w%]*)\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
 
 
@@ -28,34 +24,48 @@ def zip_directory_to_bytes(dir_path: Path) -> bytes:
                 zf.write(file, arcname=file.relative_to(dir_path))
     return buffer.getvalue()
 
-def solveFile(solver, path):
-    # Ensure a clean state before each run
-    dss.Basic.ClearAll()
-    dss.Text.Command(f"redirect {path}")
-    dss.Monitors.SaveAll()
-    return dss.Monitors.AllNames()
-
-def getMonitorDataByName(monitor_name, monitors):
-    # Find the index of the specified monitor
-    index = None
-    for i, name in enumerate(monitors):
-        if name.lower() == monitor_name.lower():
-            index = i
-            break
-
-    if index is not None:
-        dss.Monitors.Name(monitors[index])
-        # Get monitor data as a matrix (list of floats)
-        data = dss.Monitors.Channel(1)  # channel 1 usually corresponds to active power in kW
-        return data
-    else:
+def parse_worker_payload(raw_output: str) -> dict | None:
+    raw = raw_output.strip()
+    if not raw:
         return None
-    
-def run_solver_with_monitor(solver, path, monitor_name=None):
-    monitors = solveFile(solver, path)
-    if monitor_name is None:
-        return monitors
-    return getMonitorDataByName(monitor_name, monitors)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+    for line in reversed(raw.splitlines()):
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith("{") and line.endswith("}"):
+            try:
+                return json.loads(line)
+            except json.JSONDecodeError:
+                continue
+    return None
+
+
+def get_available_monitors(main_path: Path) -> tuple[list[str], str | None]:
+    # Use the worker subprocess to avoid OpenDSS calls in Streamlit process.
+    worker_path = Path(__file__).resolve().parent.parent / "utils" / "run_case_worker.py"
+    cmd = [
+        sys.executable,
+        str(worker_path),
+        "--main",
+        str(main_path),
+    ]
+    completed = subprocess.run(cmd, capture_output=True, text=True, cwd=worker_path.parent.parent)
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "Worker falhou"
+        return [], detail
+    payload = parse_worker_payload(completed.stdout)
+    if not payload:
+        detail = completed.stderr.strip() or completed.stdout.strip() or "Saida do worker invalida"
+        return [], detail
+    if not payload.get("ok", False):
+        return [], payload.get("error") or "Worker retornou erro"
+    result = payload.get("result", {})
+    monitors = result.get("monitors") or []
+    return [str(m) for m in monitors], None
 
 
 def randomize_value(base_value: float, threshold_pct: float, rng: random.Random) -> float:
@@ -160,9 +170,8 @@ def run_single_case(
             "error": completed.stderr.strip() or completed.stdout.strip() or "Worker failed",
         }
 
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError:
+    payload = parse_worker_payload(completed.stdout)
+    if not payload:
         return {
             "case": case_index,
             "data": None,
@@ -189,13 +198,23 @@ def run_single_case(
     }
 
 
-def run_cases_parallel(case_count: int, extract_dir: str, main_file: str, monitor_names: list[str], selections: list, base_seed: int | None = None):
+def run_cases_parallel(
+    case_count: int,
+    extract_dir: str,
+    main_file: str,
+    monitor_names: list[str],
+    selections: list,
+    base_seed: int | None = None,
+    max_workers_override: int | None = None,
+):
     # Thread pool only orchestrates subprocesses; OpenDSS runs per-process.
     results = []
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     cpu_guess = os.cpu_count() or 4
     max_workers = min(case_count, max(1, cpu_guess))
+    if max_workers_override is not None:
+        max_workers = max(1, min(case_count, max_workers_override))
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -270,13 +289,33 @@ st.write(f"- Arquivo principal: {main_file}")
 st.write(f"- Diretório extraído: {extract_dir}")
 st.write(f"- Casos em paralelo: {case_count}")
 
-benchmark_mode = st.checkbox("Modo benchmark (executar série + paralelo)")
+benchmark_mode = st.checkbox("Modo benchmark (executar comparações)")
+benchmark_option = "serial_parallel"
+benchmark_max_workers = None
+cpu_guess = os.cpu_count() or 4
+max_workers_default = min(case_count, max(1, cpu_guess))
+if benchmark_mode:
+    benchmark_option = st.selectbox(
+        "Tipo de benchmark",
+        options=["Serial vs paralelo", "Benchmark incremental"],
+        index=0,
+    )
+    if benchmark_option == "Benchmark incremental":
+        benchmark_max_workers = st.number_input(
+            "Maximo de workers para o benchmark",
+            min_value=1,
+            max_value=max_workers_default,
+            value=max_workers_default,
+            help="Executa todos os casos com 1..N workers e mede o tempo total.",
+        )
 
 main_path = Path(extract_dir) / main_file
-available_monitors = run_solver_with_monitor(SOLVER, str(main_path), monitor_name=None)
+available_monitors, monitor_error = get_available_monitors(main_path)
 
 st.subheader("Selecione os monitores a acompanhar")
 if not available_monitors:
+    if monitor_error:
+        st.error(f"Falha ao listar monitores: {monitor_error}")
     st.warning("Nenhum monitor encontrado no circuito carregado.")
     st.stop()
 
@@ -307,7 +346,7 @@ else:
     st.stop()
 
 with st.spinner("Gerando casos randomizados e executando no OpenDSS..."):
-    if benchmark_mode:
+    if benchmark_mode and benchmark_option == "Serial vs paralelo":
         serial_start = time.perf_counter()
         _, serial_workers = run_cases_serial(
             case_count=case_count,
@@ -329,6 +368,29 @@ with st.spinner("Gerando casos randomizados e executando no OpenDSS..."):
             base_seed=run_seed,
         )
         parallel_duration = time.perf_counter() - parallel_start
+        benchmark_series = None
+    elif benchmark_mode and benchmark_option == "Benchmark incremental":
+        max_workers = int(benchmark_max_workers or max_workers_default)
+        benchmark_series = []
+        results = []
+        workers_used = max_workers
+        for workers in range(1, max_workers + 1):
+            run_start = time.perf_counter()
+            run_results, _ = run_cases_parallel(
+                case_count=case_count,
+                extract_dir=extract_dir,
+                main_file=main_file,
+                monitor_names=selected_monitors,
+                selections=random_plan,
+                base_seed=run_seed,
+                max_workers_override=workers,
+            )
+            duration = time.perf_counter() - run_start
+            benchmark_series.append({"workers": workers, "seconds": duration})
+            results = run_results
+        parallel_duration = benchmark_series[-1]["seconds"] if benchmark_series else 0.0
+        serial_duration = None
+        serial_workers = None
     else:
         start = time.perf_counter()
         results, workers_used = run_cases_parallel(
@@ -342,6 +404,7 @@ with st.spinner("Gerando casos randomizados e executando no OpenDSS..."):
         parallel_duration = time.perf_counter() - start
         serial_duration = None
         serial_workers = None
+        benchmark_series = None
 
 st.session_state["solver_result"] = results
 
@@ -378,13 +441,19 @@ for result in results:
 
 st.success("Processamento concluído.")
 
-if benchmark_mode and serial_duration is not None:
+if benchmark_mode and benchmark_option == "Serial vs paralelo" and serial_duration is not None:
     gain_pct = ((serial_duration - parallel_duration) / serial_duration * 100) if serial_duration else 0.0
     st.info(
         f"Tempo sem paralelismo: {serial_duration:.2f} s (workers: {serial_workers}) | "
         f"Tempo com paralelismo: {parallel_duration:.2f} s (workers: {workers_used}) | "
         f"Ganho: {gain_pct:.1f}%"
     )
+elif benchmark_mode and benchmark_option == "Benchmark incremental":
+    if benchmark_series:
+        st.subheader("Benchmark incremental (threads x tempo)")
+        st.line_chart(benchmark_series, x="workers", y="seconds")
+        st.dataframe(benchmark_series)
+    st.info(f"Tempo com {workers_used} workers: {parallel_duration:.2f} s")
 else:
     st.info(f"Tempo total: {parallel_duration:.2f} segundos | Workers usados: {workers_used}")
 

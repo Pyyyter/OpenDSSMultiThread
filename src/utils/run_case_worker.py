@@ -47,8 +47,6 @@ def main(argv=None):
         monitors = None
         if args.monitors:
             try:
-                import json
-
                 monitors = json.loads(args.monitors)
             except Exception:
                 monitors = None
