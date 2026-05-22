@@ -19,6 +19,25 @@ def to_serializable(obj: Any):
     return obj
 
 
+def serialize_monitor(name: str):
+    dss.Monitors.Name(name)
+    matrix = dss.Monitors.AsMatrix()
+    headers = list(dss.Monitors.Header())
+    hours = to_serializable(dss.Monitors.dblHour())
+    rows = to_serializable(matrix)
+    for idx, row in enumerate(rows):
+        if idx < len(hours) and len(row) > 1:
+            row[1] = hours[idx]
+    row_width = len(rows[0]) if rows else 0
+    columns = ["sample", "hour", *headers]
+    if row_width and len(columns) != row_width:
+        if len(columns) < row_width:
+            columns.extend(f"col_{idx}" for idx in range(len(columns), row_width))
+        else:
+            columns = columns[:row_width]
+    return {"columns": columns, "rows": rows}
+
+
 def solve(main_path: str, monitor_names: list[str] | None):
     dss.Basic.ClearAll()
     dss.Text.Command(f"redirect {main_path}")
@@ -29,8 +48,7 @@ def solve(main_path: str, monitor_names: list[str] | None):
         targets = {m.lower() for m in monitor_names}
         for name in monitors:
             if name.lower() in targets:
-                dss.Monitors.Name(name)
-                data[name] = to_serializable(dss.Monitors.Channel(1))
+                data[name] = serialize_monitor(name)
     return {
         "monitors": to_serializable(monitors),
         "data": data,
@@ -63,3 +81,4 @@ def main(argv=None):
 
 if __name__ == "__main__":
     main()
+ 

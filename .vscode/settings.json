@@ -1,0 +1,8 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "/^python -m py_compile \"c:\\\\Users\\\\pyyyt\\\\OneDrive\\\\Documentos\\\\GitHub\\\\OpenDSSMultiThread\\\\src\\\\pages\\\\loading\\.py\"$/": {
+            "approve": true,
+            "matchCommandLine": true
+        }
+    }
+}

@@ -207,7 +207,6 @@ for idx, (title, desc) in enumerate(features.items()):
                             threshold = st.number_input(
                                 "Limite de aleatoriedade (%)",
                                 min_value=0.0,
-                                max_value=100.0,
                                 value=10.0,
                                 key=f"thr_{safe_key}",
                             )
@@ -239,4 +238,4 @@ st.subheader("Ready to contribute?")
 st.write(
     "Join the community, report issues, and collaborate on improving the OpenDSS MultiThread platform."
 )
-st.link_button("View on GitHub", "https://github.com/pyyyt/OpenDSSMultiThread")
+st.link_button("View on GitHub", "https://github.com/pyyyt/OpenDSSMultiThread") 
