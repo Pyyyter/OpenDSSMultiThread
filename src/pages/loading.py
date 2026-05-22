@@ -332,13 +332,25 @@ def run_single_case(
     }
 
 
-def run_cases_parallel(case_count: int, extract_dir: str, main_file: str, monitor_names: list[str], selections: list, base_seed: int | None = None):
+def run_cases_parallel(
+    case_count: int,
+    extract_dir: str,
+    main_file: str,
+    monitor_names: list[str],
+    selections: list,
+    base_seed: int | None = None,
+    max_workers: int | None = None,
+):
     # Thread pool only orchestrates subprocesses; OpenDSS runs per-process.
     results = []
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     cpu_guess = os.cpu_count() or 4
-    max_workers = min(case_count, max(1, cpu_guess))
+    capped_workers = min(case_count, max(1, cpu_guess))
+    if max_workers is None:
+        max_workers = capped_workers
+    else:
+        max_workers = max(1, min(case_count, max_workers))
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
@@ -392,6 +404,9 @@ DEFAULT_SESSION_STATE = {
     "last_workers_used": None,
     "last_serial_workers": None,
     "last_benchmark_mode": False,
+    "last_benchmark_option": "Normal",
+    "last_incremental_results": None,
+    "last_incremental_workers": None,
     "current_run_seed": None,
     "results_view_mode": "table",
 }
@@ -420,7 +435,25 @@ st.write(f"- Arquivo principal: {main_file}")
 st.write(f"- Diretório extraído: {extract_dir}")
 st.write(f"- Casos em paralelo: {case_count}")
 
-benchmark_mode = st.checkbox("Modo benchmark (executar série + paralelo)")
+benchmark_options = ["Normal", "Benchmark (serial + paralelo)", "Benchmark incremental"]
+stored_benchmark_option = st.session_state.get("last_benchmark_option")
+benchmark_option = st.selectbox(
+    "Modo de execução",
+    options=benchmark_options,
+    index=benchmark_options.index(stored_benchmark_option)
+    if stored_benchmark_option in benchmark_options
+    else 0,
+)
+benchmark_mode = benchmark_option != "Normal"
+incremental_workers = None
+if benchmark_option == "Benchmark incremental":
+    incremental_workers = st.number_input(
+        "Quantidade máxima de workers para o benchmark incremental",
+        min_value=1,
+        value=int(st.session_state.get("last_incremental_workers") or min(case_count, (os.cpu_count() or 4))),
+        help="Executa os casos com 1..N workers e mede o tempo em cada etapa.",
+        key="benchmark_incremental_workers",
+    )
 
 main_path = Path(extract_dir) / main_file
 monitors_cache_key = f"{main_path}"
@@ -485,6 +518,9 @@ if run_requested:
     st.session_state["pending_monitor_targets"] = monitor_targets
     st.session_state["current_run_seed"] = random.SystemRandom().getrandbits(64)
     st.session_state["last_benchmark_mode"] = benchmark_mode
+    st.session_state["last_benchmark_option"] = benchmark_option
+    if incremental_workers is not None:
+        st.session_state["last_incremental_workers"] = int(incremental_workers)
 elif st.session_state.get("solver_result") is None:
     st.stop()
 
@@ -497,7 +533,8 @@ should_run = run_requested or st.session_state.get("solver_result") is None
 
 if should_run:
     with st.spinner("Gerando casos randomizados e executando no OpenDSS..."):
-        if benchmark_mode:
+        incremental_results = None
+        if benchmark_option == "Benchmark (serial + paralelo)":
             serial_start = time.perf_counter()
             _, serial_workers = run_cases_serial(
                 case_count=case_count,
@@ -519,6 +556,26 @@ if should_run:
                 base_seed=run_seed,
             )
             parallel_duration = time.perf_counter() - parallel_start
+        elif benchmark_option == "Benchmark incremental":
+            serial_duration = None
+            serial_workers = None
+            workers_used = None
+            incremental_results = []
+            max_workers = int(incremental_workers or 1)
+            for worker_count in range(1, max_workers + 1):
+                start = time.perf_counter()
+                results, workers_used = run_cases_parallel(
+                    case_count=case_count,
+                    extract_dir=extract_dir,
+                    main_file=main_file,
+                    monitor_names=selected_monitors,
+                    selections=random_plan,
+                    base_seed=run_seed,
+                    max_workers=worker_count,
+                )
+                duration = time.perf_counter() - start
+                incremental_results.append({"workers": worker_count, "seconds": duration})
+            parallel_duration = None
         else:
             start = time.perf_counter()
             results, workers_used = run_cases_parallel(
@@ -538,6 +595,8 @@ if should_run:
     st.session_state["last_workers_used"] = workers_used
     st.session_state["last_serial_workers"] = serial_workers
     st.session_state["last_benchmark_mode"] = benchmark_mode
+    st.session_state["last_benchmark_option"] = benchmark_option
+    st.session_state["last_incremental_results"] = incremental_results
 else:
     results = st.session_state.get("solver_result", [])
     parallel_duration = st.session_state.get("last_parallel_duration")
@@ -545,6 +604,8 @@ else:
     workers_used = st.session_state.get("last_workers_used")
     serial_workers = st.session_state.get("last_serial_workers")
     benchmark_mode = st.session_state.get("last_benchmark_mode", benchmark_mode)
+    benchmark_option = st.session_state.get("last_benchmark_option", benchmark_option)
+    incremental_results = st.session_state.get("last_incremental_results")
 
 overflow_counts = {m: 0 for m in selected_monitors}
 
@@ -567,7 +628,7 @@ for result in results:
 
 st.success("Processamento concluído.")
 
-if benchmark_mode and serial_duration is not None:
+if benchmark_option == "Benchmark (serial + paralelo)" and serial_duration is not None:
     if serial_duration > 0:
         gain_pct = (serial_duration - parallel_duration) / serial_duration * 100
         gain_msg = f" | Ganho: {gain_pct:.1f}%"
@@ -577,8 +638,19 @@ if benchmark_mode and serial_duration is not None:
         f"Tempo sem paralelismo: {serial_duration:.2f} s (workers: {serial_workers}) | "
         f"Tempo com paralelismo: {parallel_duration:.2f} s (workers: {workers_used})" + gain_msg
     )
+elif benchmark_option == "Benchmark incremental":
+    st.info("Benchmark incremental concluído. Confira o gráfico abaixo.")
 else:
     st.info(f"Tempo total: {parallel_duration:.2f} segundos | Workers usados: {workers_used}")
+
+if benchmark_option == "Benchmark incremental" and incremental_results:
+    bench_frame = pd.DataFrame(incremental_results)
+    if not bench_frame.empty:
+        bench_frame = bench_frame.sort_values("workers")
+        chart_frame = bench_frame.set_index("workers")
+        st.subheader("Benchmark incremental")
+        st.caption("Tempo total por quantidade de workers.")
+        st.line_chart(chart_frame, use_container_width=True)
 
 st.subheader("Estouro de offset por monitor")
 for monitor in selected_monitors:
