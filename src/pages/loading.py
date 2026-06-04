@@ -14,6 +14,7 @@ import zipfile
 
 import pandas as pd
 import opendssdirect as dss
+import altair as alt
 
 SOLVER = "OpenDSS"
 
@@ -144,6 +145,51 @@ def frame_value_columns(frame: pd.DataFrame) -> list[str]:
         if numeric_values.notna().any():
             value_columns.append(column)
     return value_columns
+
+
+def build_monitor_ci_frame(results: list[dict], monitor_name: str) -> pd.DataFrame:
+    series_list = []
+    for result in results:
+        if result.get("error"):
+            continue
+        data_map = result.get("data") or {}
+        frame = pick_monitor_values(data_map, monitor_name)
+        if frame is None or frame.empty:
+            continue
+        value_columns = frame_value_columns(frame)
+        if not value_columns:
+            continue
+        numeric_frame = frame[value_columns].apply(pd.to_numeric, errors="coerce")
+        if numeric_frame.empty:
+            continue
+        mean_series = numeric_frame.mean(axis=1, skipna=True)
+        if "hour" in frame.columns:
+            hour_series = pd.to_numeric(frame["hour"], errors="coerce")
+            mean_series.index = hour_series
+        else:
+            mean_series.index = pd.RangeIndex(start=0, stop=len(mean_series), step=1)
+        series_list.append(mean_series)
+
+    if not series_list:
+        return pd.DataFrame()
+
+    aligned = pd.concat(series_list, axis=1)
+    aligned = aligned.dropna(how="all")
+    count = aligned.count(axis=1)
+    mean = aligned.mean(axis=1, skipna=True)
+    std = aligned.std(axis=1, ddof=1, skipna=True).fillna(0.0)
+    ci = 1.96 * std / count.replace(0, pd.NA).pow(0.5)
+    ci = ci.fillna(0.0)
+    frame = pd.DataFrame(
+        {
+            "iteracao": aligned.index,
+            "media": mean,
+            "ci_lower": mean - ci,
+            "ci_upper": mean + ci,
+            "amostras": count,
+        }
+    )
+    return frame.dropna(subset=["iteracao", "media"])
 
 
 def build_case_long_frame(result: dict, monitor_names: list[str]) -> pd.DataFrame:
@@ -608,11 +654,13 @@ else:
     incremental_results = st.session_state.get("last_incremental_results")
 
 overflow_counts = {m: 0 for m in selected_monitors}
+violations_per_case: list[int] = []
 
 for result in results:
     if result.get("error"):
         continue
     data_map = result.get("data") or {}
+    case_violation_count = 0
     for monitor in selected_monitors:
         frame = pick_monitor_values(data_map, monitor)
         if frame is None or frame.empty:
@@ -625,6 +673,8 @@ for result in results:
         values = monitor_violation_series(frame)
         if not values.empty and any((v < lower) or (v > upper) for v in values.dropna()):
             overflow_counts[monitor] += 1
+            case_violation_count += 1
+    violations_per_case.append(case_violation_count)
 
 st.success("Processamento concluído.")
 
@@ -656,6 +706,27 @@ st.subheader("Estouro de offset por monitor")
 for monitor in selected_monitors:
     count = overflow_counts.get(monitor, 0)
     st.metric(label=monitor, value=f"{count} / {case_count}", help="Cenários em que o valor ultrapassou o offset definido.")
+
+if violations_per_case and any(count > 0 for count in violations_per_case):
+    freq_series = pd.Series(violations_per_case).value_counts().sort_index()
+    freq_frame = pd.DataFrame(
+        {
+            "violacoes": freq_series.index,
+            "percentual": (freq_series.values / len(violations_per_case)) * 100,
+        }
+    )
+    st.subheader("Frequencia de violacoes")
+    violation_chart = (
+        alt.Chart(freq_frame)
+        .mark_bar(color="#c6ddf0", stroke="#2f2f2f", strokeWidth=1)
+        .encode(
+            x=alt.X("violacoes:O", title="Nº de violacoes"),
+            y=alt.Y("percentual:Q", title="Frequencia de Violacoes de Tensao (%)"),
+            tooltip=["violacoes:O", alt.Tooltip("percentual:Q", format=".1f")],
+        )
+        .properties(height=260)
+    )
+    st.altair_chart(violation_chart, use_container_width=True)
 
 st.subheader("Resultados do caso")
 case_options = [result.get("case") for result in results]
@@ -731,3 +802,34 @@ else:
                 st.write(f"Monitor: {monitor}")
                 st.dataframe(frame, use_container_width=True)
             st.caption(f"Monitores disponíveis: {', '.join(selected_result.get('monitors', []))}")
+
+st.subheader("Média e intervalo de confiança")
+ci_monitor = st.selectbox(
+    "Monitor para média",
+    options=selected_monitors,
+    index=0,
+    key="ci_monitor",
+)
+ci_frame = build_monitor_ci_frame(results, ci_monitor)
+if ci_frame.empty:
+    st.warning("Não há dados suficientes para calcular a média e o intervalo de confiança.")
+else:
+    ci_band = (
+        alt.Chart(ci_frame)
+        .mark_area(opacity=0.25, color="#7aaed6")
+        .encode(
+            x=alt.X("iteracao:Q", title="Iteracoes"),
+            y=alt.Y("ci_lower:Q", title="Tensao (pu)"),
+            y2=alt.Y2("ci_upper:Q"),
+        )
+    )
+    ci_line = (
+        alt.Chart(ci_frame)
+        .mark_line(color="#1f4f7a", strokeWidth=2)
+        .encode(
+            x=alt.X("iteracao:Q", title="Iteracoes"),
+            y=alt.Y("media:Q", title="Tensao (pu)"),
+        )
+    )
+    ci_chart = (ci_band + ci_line).properties(height=320)
+    st.altair_chart(ci_chart, use_container_width=True)

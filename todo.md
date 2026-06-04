@@ -1,7 +1,11 @@
 13/03/2026
 
 Próximos passos:
-    Considerar as 3 fases da rede elétrica
+    Considerar as 3 fases da rede elétrica - fix
+    Mostrar todas as linhas de todas as simulações
+    Normalizar gráfico
+    Tentar mostrar boxplot
+    Igualar variáveis
 
 Calcular os seguintes indicadores:
 
