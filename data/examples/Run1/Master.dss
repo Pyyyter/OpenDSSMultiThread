@@ -1,0 +1,45 @@
+clear
+!________________________________________________________________________________________________________________________________ 
+!DEFINICAO DO EQUIVALENTE THEVENIN
+	New Circuit.CircuitoTeste bus1=barra1 pu=1.0  basekV=13.8 phases= 3
+!_________________________________________________________________________________________________________________________________
+!DEFINICAO DA LINHA
+	New Line.line1 Bus1=barra1 bus2=barra2 Length=100 units=m
+!_________________________________________________________________________________________________________________________________
+!DEFINICAO DA CARGA
+	redirect Carga.dss
+!_________________________________________________________________________________________________________________________________
+!DEFINICAO DO MODELO PVSYSTEM
+	redirect PVSystem.dss
+!_________________________________________________________________________________________________________________________________
+!DEFINICAO DO ENERGYMETER
+	New energymeter.Substation element=Line.line1 term=1
+!_________________________________________________________________________________________________________________________________
+!DEFINICAO DOS MONITORS 
+	new monitor.PotenciaPV PVSystem.PV terminal=1 mode=1 ppolar=no
+	new monitor.TensaoBarra line.line1 terminal=2 mode=0
+	new monitor.PotenciaCarga load.CargaA terminal=1 mode=1 ppolar=no
+	new monitor.PotenciaBarra line.line1 terminal=1 mode=1 ppolar=no
+!_________________________________________________________________________________________________________________________________
+!CONFIGURACOES DA SIMULACAO
+	set voltagebases=[13.8]
+	calcv
+	Set mode=daily
+	!Set number=4 !Hora com a maior tensao (menor carga)
+	!Set number=19 !Hora com  menor tensao (maior carga)
+	!Set number=12
+	!Set number=15 !Hora com a maior geracao FV
+	Solve
+!_________________________________________________________________________________________________________________________________
+!EXIBINDO RESULTADOS
+	!Plot profile
+	!Export profile
+	!Plot monitor object= potenciapv channels=(1 )
+	!Plot monitor object= tensaobarra channels=(1 3 5 )
+	!Plot monitor object= potenciacarga channels=(1 )
+	!Plot monitor object= potenciabarra channels=(1 )
+	!Export monitors potenciapv
+	!Export PVSystem_Meters
+	!Show variables 
+
+
