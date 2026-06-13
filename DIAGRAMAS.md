@@ -312,9 +312,8 @@ graph TD
     RECOVER -->|Yes| HOME["Allow Retry"]
     RECOVER -->|No| STOP["Stop Execution"]
     
-    HOME --> [*]
-    STOP --> [*]
-    
+    HOME --> END((End))
+    STOP --> END
     style ERR fill:#ffcccc
     style SHOW fill:#ffe0b2
 ```
@@ -365,4 +364,4 @@ graph TB
 
 **Versão:** 1.0  
 **Data:** 2026-06-06  
-**Status:** Referência Rápida para Desenvolvimento
+**Status:** Referência Inicial   para Desenvolvimento
