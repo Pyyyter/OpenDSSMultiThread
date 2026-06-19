@@ -1,15 +1,18 @@
+"""
+Main application page - Upload and Configuration.
+
+Handles:
+- File upload and extraction
+- DSS file selection
+- Variable parsing and selection
+- Randomization configuration
+- Case generation and navigation to loading page
+"""
 import streamlit as st
-from collections import defaultdict
-from io import BytesIO
 from pathlib import Path
-import bz2
-import gzip
-import lzma
-import re
-import tarfile
-import tempfile
-import zipfile
-from shutil import copyfileobj
+
+# NOTE: This file is refactored to use service layer.
+# Placeholders marked with TODO: implement will be filled during development.
 
 st.set_page_config(page_title="OpenDSS MultiThread", page_icon="🌐", layout="wide")
 
@@ -26,14 +29,24 @@ for key, default in DEFAULT_SESSION_STATE.items():
     st.session_state.setdefault(key, default)
 
 
-NUMERIC_PATTERN = re.compile(r"(?i)([a-z][\w%]*)\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
+# ============================================================================
+# Service Imports (will be implemented in utils/)
+# ============================================================================
 
+# TODO: Import from utils
+# from utils import ArchiveService, VariableParser, RandomizationPlanner, etc.
+
+
+# ============================================================================
+# Helper Functions
+# ============================================================================
 
 def parse_file_variables(path: Path, root: Path):
     """Extract numeric parameters from DSS/TXT files so the user can randomize them."""
+    # TODO: Move to VariableParser.parse_numeric_variables()
     text = path.read_text(encoding="utf-8", errors="ignore")
     variables = []
-    per_key_occurrence = defaultdict(int)  # track occurrence per key so replacements align
+    per_key_occurrence = {}  # track occurrence per key
 
     if path.suffix.lower() == ".txt":
         for idx, raw in enumerate(text.splitlines(), start=1):
