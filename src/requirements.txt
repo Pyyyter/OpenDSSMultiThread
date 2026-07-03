@@ -5,3 +5,5 @@ pyyaml>=6.0
 typer>=0.9
 rich>=13.0
 opendssdirect.py
+plotly>=5.0
+streamlit-plotly-events>=0.0.6
