@@ -1,4 +1,4 @@
-import streamlit as st
+﻿import streamlit as st
 from pathlib import Path
 import json
 from io import BytesIO
@@ -15,7 +15,6 @@ import zipfile
 import pandas as pd
 import opendssdirect as dss
 import plotly.graph_objects as go
-import plotly.express as px
 from plotly.subplots import make_subplots
 
 SOLVER = "OpenDSS"
@@ -220,10 +219,17 @@ def build_cumulative_voltage_frame(results: list[dict], monitor_names: list[str]
             voltage_values.extend(float(value) for value in numeric_values.tolist())
 
         if voltage_values:
+            series = pd.Series(voltage_values, dtype="float64")
+            mean_value = float(series.mean())
+            std_value = float(series.std(ddof=1)) if len(series) > 1 else 0.0
+            ci_value = 1.96 * std_value / (len(series) ** 0.5) if len(series) > 1 else 0.0
             rows.append(
                 {
                     "case": int(result.get("case", len(rows) + 1)),
-                    "media_tensao_maxima": float(pd.Series(voltage_values).mean()),
+                    "media_tensao_maxima": mean_value,
+                    "desvio_padrao": std_value,
+                    "ci_lower": mean_value - ci_value,
+                    "ci_upper": mean_value + ci_value,
                     "amostras": len(voltage_values),
                 }
             )
@@ -233,7 +239,81 @@ def build_cumulative_voltage_frame(results: list[dict], monitor_names: list[str]
 
     frame = pd.DataFrame(rows).sort_values("case")
     frame["media_acumulada"] = frame["media_tensao_maxima"].expanding().mean()
+    frame["desvio_padrao_acumulado"] = frame["media_tensao_maxima"].expanding().std(ddof=1).fillna(0.0)
+    cumulative_count = pd.Series(range(1, len(frame) + 1), index=frame.index, dtype="float64")
+    cumulative_ci = 1.96 * frame["desvio_padrao_acumulado"] / cumulative_count.pow(0.5)
+    frame["ci_lower_acumulado"] = frame["media_acumulada"] - cumulative_ci
+    frame["ci_upper_acumulado"] = frame["media_acumulada"] + cumulative_ci
+    frame["amostras_acumuladas"] = cumulative_count.astype(int)
     return frame
+
+
+def calculate_monitor_limits(target_value: float, offset_value: float, offset_mode: str) -> tuple[float, float]:
+    if offset_mode == "relativo":
+        delta = abs(target_value) * (offset_value / 100.0)
+    else:
+        delta = offset_value
+    return target_value - delta, target_value + delta
+
+
+def build_violation_summary_frame(
+    results: list[dict],
+    monitor_names: list[str],
+    monitor_targets: dict[str, float],
+    monitor_offsets: dict[str, float],
+    offset_mode: str,
+) -> pd.DataFrame:
+    rows = []
+    successful_cases = [result for result in results if not result.get("error")]
+    successful_case_count = len(successful_cases)
+
+    for monitor_name in monitor_names:
+        target_value = float(monitor_targets.get(monitor_name, 0.0))
+        offset_value = float(monitor_offsets.get(monitor_name, 0.0))
+        lower_limit, upper_limit = calculate_monitor_limits(target_value, offset_value, offset_mode)
+
+        total_samples = 0
+        total_violations = 0
+        cases_with_violation = 0
+
+        for result in successful_cases:
+            data_map = result.get("data") or {}
+            frame = pick_monitor_values(data_map, monitor_name)
+            if frame is None or frame.empty:
+                continue
+
+            values = monitor_violation_series(add_voltage_max_column(frame)).dropna()
+            sample_count = int(len(values))
+            if sample_count == 0:
+                continue
+
+            violation_count = int(((values < lower_limit) | (values > upper_limit)).sum())
+            total_samples += sample_count
+            total_violations += violation_count
+            if violation_count > 0:
+                cases_with_violation += 1
+
+        rows.append(
+            {
+                "monitor": monitor_name,
+                "valor_ideal": target_value,
+                "offset": offset_value,
+                "modo_offset": offset_mode,
+                "limite_inferior": lower_limit,
+                "limite_superior": upper_limit,
+                "total_amostras": total_samples,
+                "total_violacoes": total_violations,
+                "casos_com_violacao": cases_with_violation,
+                "casos_total": successful_case_count,
+                "taxa_violacao_hora": (total_violations / total_samples) if total_samples else 0.0,
+                "taxa_violacao_iteracao": (cases_with_violation / successful_case_count) if successful_case_count else 0.0,
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+
+    return pd.DataFrame(rows)
 
 
 def build_monitor_convergence_frame(results: list[dict], monitor_names: list[str]) -> pd.DataFrame:
@@ -561,7 +641,7 @@ def run_cases_serial(case_count: int, extract_dir: str, main_file: str, monitor_
         )
     return results, 1
 
-st.set_page_config(page_title="Carregando", page_icon="⏳")
+st.set_page_config(page_title="Carregando", page_icon="ÔÅ│")
 
 DEFAULT_SESSION_STATE = {
     "pending_main_file": None,
@@ -571,6 +651,7 @@ DEFAULT_SESSION_STATE = {
     "pending_selected_monitors": [],
     "pending_monitor_offsets": {},
     "pending_monitor_targets": {},
+    "pending_violation_offset_mode": "absoluto",
     "solver_result": None,
     "last_parallel_duration": None,
     "last_serial_duration": None,
@@ -580,6 +661,7 @@ DEFAULT_SESSION_STATE = {
     "last_benchmark_option": "Normal",
     "last_incremental_results": None,
     "last_incremental_workers": None,
+    "last_violation_offset_mode": "absoluto",
     "current_run_seed": None,
     "results_view_mode": "table",
 }
@@ -594,24 +676,25 @@ case_count = int(st.session_state.get("pending_case_count", 1))
 stored_selected_monitors = st.session_state.get("pending_selected_monitors", [])
 stored_monitor_offsets = st.session_state.get("pending_monitor_offsets", {})
 stored_monitor_targets = st.session_state.get("pending_monitor_targets", {})
+stored_violation_offset_mode = st.session_state.get("pending_violation_offset_mode", "absoluto")
 
 if not all([main_file, extract_dir]):
-    st.warning("Dados pendentes não encontrados. Volte para a página inicial.")
+    st.warning("Dados pendentes n├úo encontrados. Volte para a p├ígina inicial.")
     st.stop()
 
 if not random_plan:
-    st.warning("Nenhum plano de randomização foi enviado. Volte e selecione as variáveis.")
+    st.warning("Nenhum plano de randomiza├º├úo foi enviado. Volte e selecione as vari├íveis.")
     st.stop()
 
 st.write("Carregando...")
 st.write(f"- Arquivo principal: {main_file}")
-st.write(f"- Diretório extraído: {extract_dir}")
+st.write(f"- Diret├│rio extra├¡do: {extract_dir}")
 st.write(f"- Casos em paralelo: {case_count}")
 
 benchmark_options = ["Normal", "Benchmark (serial + paralelo)", "Benchmark incremental"]
 stored_benchmark_option = st.session_state.get("last_benchmark_option")
 benchmark_option = st.selectbox(
-    "Modo de execução",
+    "Modo de execu├º├úo",
     options=benchmark_options,
     index=benchmark_options.index(stored_benchmark_option)
     if stored_benchmark_option in benchmark_options
@@ -621,7 +704,7 @@ benchmark_mode = benchmark_option != "Normal"
 incremental_workers = None
 if benchmark_option == "Benchmark incremental":
     incremental_workers = st.number_input(
-        "Quantidade máxima de workers para o benchmark incremental",
+        "Quantidade m├íxima de workers para o benchmark incremental",
         min_value=1,
         value=int(st.session_state.get("last_incremental_workers") or min(case_count, (os.cpu_count() or 4))),
         help="Executa os casos com 1..N workers e mede o tempo em cada etapa.",
@@ -658,9 +741,18 @@ if not available_monitors:
     st.stop()
 
 selected_monitors = st.multiselect(
-    "Monitores disponíveis",
+    "Monitores dispon├¡veis",
     options=available_monitors,
     default=stored_selected_monitors or available_monitors,
+)
+
+violation_offset_mode = st.radio(
+    "Modo do offset",
+    options=["absoluto", "relativo"],
+    format_func=lambda value: "Absoluto" if value == "absoluto" else "Relativo (%)",
+    index=0 if stored_violation_offset_mode == "absoluto" else 1,
+    horizontal=True,
+    help="No modo relativo, o offset é interpretado como porcentagem do valor ideal.",
 )
 
 monitor_offsets: dict[str, float] = {}
@@ -670,28 +762,34 @@ for monitor in selected_monitors:
         f"Valor desejado para {monitor}",
         value=float(stored_monitor_targets.get(monitor, 0.0)),
         key=f"target_{monitor}",
-        help="Referência central esperada para o monitor.",
+        help="Refer├¬ncia central esperada para o monitor.",
     )
+    offset_label = "Offset relativo (%)" if violation_offset_mode == "relativo" else "Offset absoluto"
     monitor_offsets[monitor] = st.number_input(
-        f"Offset máximo permitido para {monitor}",
+        f"{offset_label} para {monitor}",
         min_value=0.0,
         value=float(stored_monitor_offsets.get(monitor, 0.0)),
         key=f"offset_{monitor}",
-        help="Estouro ocorre se algum valor ficar fora de valor desejado ± offset.",
+        help=(
+            "Estouro ocorre se algum valor ficar fora do intervalo ideal. "
+            "No modo relativo, o offset é aplicado como porcentagem do valor ideal."
+        ),
     )
 
 if not selected_monitors:
     st.warning("Selecione pelo menos um monitor para continuar.")
     st.stop()
 
-run_requested = st.button("Executar simulações", type="primary")
+run_requested = st.button("Executar simula├º├Áes", type="primary")
 if run_requested:
     st.session_state["pending_selected_monitors"] = selected_monitors
     st.session_state["pending_monitor_offsets"] = monitor_offsets
     st.session_state["pending_monitor_targets"] = monitor_targets
+    st.session_state["pending_violation_offset_mode"] = violation_offset_mode
     st.session_state["current_run_seed"] = random.SystemRandom().getrandbits(64)
     st.session_state["last_benchmark_mode"] = benchmark_mode
     st.session_state["last_benchmark_option"] = benchmark_option
+    st.session_state["last_violation_offset_mode"] = violation_offset_mode
     if incremental_workers is not None:
         st.session_state["last_incremental_workers"] = int(incremental_workers)
 elif st.session_state.get("solver_result") is None:
@@ -764,7 +862,7 @@ if should_run:
                 serial_duration = None
                 serial_workers = None
         except Exception as exc:
-            st.error(f"Erro ao executar simulações: {type(exc).__name__}: {str(exc)}")
+            st.error(f"Erro ao executar simula├º├Áes: {type(exc).__name__}: {str(exc)}")
             import traceback
             st.error(traceback.format_exc())
             st.stop()
@@ -785,6 +883,7 @@ else:
     benchmark_mode = st.session_state.get("last_benchmark_mode", benchmark_mode)
     benchmark_option = st.session_state.get("last_benchmark_option", benchmark_option)
     incremental_results = st.session_state.get("last_incremental_results")
+    violation_offset_mode = st.session_state.get("last_violation_offset_mode", violation_offset_mode)
 
 overflow_counts = {m: 0 for m in selected_monitors}
 violations_per_case: list[int] = []
@@ -809,7 +908,7 @@ for result in results:
             case_violation_count += 1
     violations_per_case.append(case_violation_count)
 
-st.success("Processamento concluído.")
+st.success("Processamento conclu├¡do.")
 
 if benchmark_option == "Benchmark (serial + paralelo)" and serial_duration is not None and parallel_duration is not None:
     if serial_duration > 0:
@@ -822,7 +921,7 @@ if benchmark_option == "Benchmark (serial + paralelo)" and serial_duration is no
         f"Tempo com paralelismo: {parallel_duration:.2f} s (workers: {workers_used})" + gain_msg
     )
 elif benchmark_option == "Benchmark incremental":
-    st.info("Benchmark incremental concluído. Confira o gráfico abaixo.")
+    st.info("Benchmark incremental conclu├¡do. Confira o gr├ífico abaixo.")
 else:
     if parallel_duration is not None and workers_used is not None:
         st.info(f"Tempo total: {parallel_duration:.2f} segundos | Workers usados: {workers_used}")
@@ -843,8 +942,8 @@ if benchmark_option == "Benchmark incremental" and incremental_results:
             marker=dict(size=8)
         ))
         fig_bench.update_layout(
-            title="Tempo de Execução vs Quantidade de Workers",
-            xaxis_title="Número de Workers",
+            title="Tempo de Execu├º├úo vs Quantidade de Workers",
+            xaxis_title="N├║mero de Workers",
             yaxis_title="Tempo (segundos)",
             hovermode="x unified",
             height=400,
@@ -853,46 +952,122 @@ if benchmark_option == "Benchmark incremental" and incremental_results:
         )
         st.plotly_chart(fig_bench, use_container_width=True)
 
-st.subheader("Estouro de offset por monitor")
-for monitor in selected_monitors:
-    count = overflow_counts.get(monitor, 0)
-    st.metric(label=monitor, value=f"{count} / {case_count}", help="Cenários em que o valor ultrapassou o offset definido.")
+violation_summary_frame = build_violation_summary_frame(
+    results,
+    selected_monitors,
+    monitor_targets,
+    monitor_offsets,
+    violation_offset_mode,
+)
 
-if violations_per_case and any(count > 0 for count in violations_per_case):
-    freq_series = pd.Series(violations_per_case).value_counts().sort_index()
-    freq_frame = pd.DataFrame(
-        {
-            "violacoes": freq_series.index,
-            "percentual": (freq_series.values / len(violations_per_case)) * 100,
-        }
+st.subheader("Verificação de violações por monitor")
+st.caption(
+    "A verificação é independente da simulação: ao final, cada monitor é comparado ao valor ideal e ao offset escolhido."
+)
+
+if violation_summary_frame.empty:
+    st.warning("Não há dados suficientes para calcular violações por monitor.")
+else:
+    total_violations = int(violation_summary_frame["total_violacoes"].sum())
+    total_samples = int(violation_summary_frame["total_amostras"].sum())
+    total_rate_hour = (total_violations / total_samples) if total_samples else 0.0
+    total_cases = int(violation_summary_frame["casos_total"].max())
+    monitors_with_violation = int((violation_summary_frame["casos_com_violacao"] > 0).sum())
+
+    metric_cols = st.columns(3)
+    metric_cols[0].metric(
+        "Taxa global por hora",
+        f"{total_rate_hour:.4f}",
+        help=f"{total_violations} violações em {total_samples} amostras totais.",
     )
-    st.subheader("Frequencia de violacoes")
-    fig_violations = go.Figure()
-    fig_violations.add_trace(go.Bar(
-        x=freq_frame["violacoes"].astype(str),
-        y=freq_frame["percentual"],
-        marker=dict(color="#c6ddf0", line=dict(color="#2f2f2f", width=1)),
-        hovertemplate="<b>Violações: %{x}</b><br>Frequência: %{y:.1f}%<extra></extra>"
-    ))
-    fig_violations.update_layout(
-        title="Frequência de Violações de Tensão",
-        xaxis_title="Nº de violações",
-        yaxis_title="Frequência de Violações (%)",
-        hovermode="x",
-        height=400,
-        template="plotly_white",
-        margin=dict(l=50, r=50, t=80, b=50)
+    metric_cols[1].metric(
+        "Monitores com violação",
+        f"{monitors_with_violation} / {len(violation_summary_frame)}",
+        help="Quantidade de monitores que tiveram ao menos um estouro em alguma iteração.",
     )
-    st.plotly_chart(fig_violations, use_container_width=True)
+    metric_cols[2].metric(
+        "Casos analisados",
+        f"{total_cases}",
+        help="Número de iterações/casos considerados no denominador da taxa por iteração.",
+    )
+
+    chart_col, table_col = st.columns([2, 1])
+    with chart_col:
+        fig_violations = go.Figure()
+        fig_violations.add_trace(
+            go.Bar(
+                x=violation_summary_frame["monitor"],
+                y=violation_summary_frame["taxa_violacao_hora"] * 100,
+                name="Taxa por hora (%)",
+                marker=dict(color="#1f77b4"),
+                customdata=violation_summary_frame[
+                    ["total_violacoes", "total_amostras", "casos_com_violacao", "casos_total"]
+                ].values,
+                hovertemplate=(
+                    "<b>%{x}</b><br>Taxa por hora: %{y:.2f}%<br>"
+                    "Violações: %{customdata[0]} / %{customdata[1]}<extra></extra>"
+                ),
+            )
+        )
+        fig_violations.add_trace(
+            go.Bar(
+                x=violation_summary_frame["monitor"],
+                y=violation_summary_frame["taxa_violacao_iteracao"] * 100,
+                name="Taxa por iteração (%)",
+                marker=dict(color="#ff7f0e"),
+                customdata=violation_summary_frame[
+                    ["total_violacoes", "total_amostras", "casos_com_violacao", "casos_total"]
+                ].values,
+                hovertemplate=(
+                    "<b>%{x}</b><br>Taxa por iteração: %{y:.2f}%<br>"
+                    "Iterações com violação: %{customdata[2]} / %{customdata[3]}<extra></extra>"
+                ),
+            )
+        )
+        fig_violations.update_layout(
+            title="Violação por monitor",
+            xaxis_title="Monitor",
+            yaxis_title="Taxa (%)",
+            hovermode="x",
+            barmode="group",
+            height=450,
+            template="plotly_white",
+            margin=dict(l=50, r=30, t=80, b=50),
+        )
+        st.plotly_chart(fig_violations, use_container_width=True)
+
+    with table_col:
+        display_frame = violation_summary_frame.copy()
+        display_frame["taxa_violacao_hora"] = display_frame["taxa_violacao_hora"].map(lambda value: f"{value:.4%}")
+        display_frame["taxa_violacao_iteracao"] = display_frame["taxa_violacao_iteracao"].map(lambda value: f"{value:.4%}")
+        st.dataframe(
+            display_frame[
+                [
+                    "monitor",
+                    "valor_ideal",
+                    "offset",
+                    "modo_offset",
+                    "limite_inferior",
+                    "limite_superior",
+                    "total_violacoes",
+                    "total_amostras",
+                    "taxa_violacao_hora",
+                    "casos_com_violacao",
+                    "casos_total",
+                    "taxa_violacao_iteracao",
+                ]
+            ],
+            use_container_width=True,
+        )
 
 st.subheader("Resultados do caso")
 case_options = [result.get("case") for result in results]
 if not case_options:
-    st.warning("Nenhum cenário concluído com sucesso para exibir.")
+    st.warning("Nenhum cen├írio conclu├¡do com sucesso para exibir.")
 else:
     default_case = case_options[0]
     selected_case = st.selectbox(
-        "Cenário",
+        "Cen├írio",
         options=case_options,
         index=case_options.index(st.session_state.get("selected_result_case", default_case))
         if st.session_state.get("selected_result_case", default_case) in case_options
@@ -901,20 +1076,20 @@ else:
     )
 
     view_mode = st.session_state.get("results_view_mode", "table")
-    toggle_label = "Alternar para gráfico" if view_mode == "table" else "Alternar para tabela"
+    toggle_label = "Alternar para gr├ífico" if view_mode == "table" else "Alternar para tabela"
     if st.button(toggle_label, key="toggle_results_view"):
         st.session_state["results_view_mode"] = "chart" if view_mode == "table" else "table"
         st.rerun()
 
     selected_result = get_case_result(results, int(selected_case)) if selected_case is not None else None
     if selected_result is None:
-        st.warning("Não foi possível localizar o cenário selecionado.")
+        st.warning("N├úo foi poss├¡vel localizar o cen├írio selecionado.")
     elif selected_result.get("error"):
-        st.error(f"Falha ao executar o cenário {selected_result.get('case')}: {selected_result['error']}")
+        st.error(f"Falha ao executar o cen├írio {selected_result.get('case')}: {selected_result['error']}")
     else:
         scenario_dir = selected_result.get("scenario_dir")
         if scenario_dir and Path(scenario_dir).exists():
-            st.caption(f"Pasta do cenário: {scenario_dir}")
+            st.caption(f"Pasta do cen├írio: {scenario_dir}")
             zip_bytes = zip_directory_to_bytes(Path(scenario_dir))
             st.download_button(
                 "Baixar pasta randomizada (.zip)",
@@ -925,10 +1100,10 @@ else:
             )
 
         if st.session_state.get("results_view_mode", "table") == "chart":
-            st.caption("Marque as séries que deseja exibir no gráfico. As alterações aparecem em tempo real.")
+            st.caption("Marque as s├®ries que deseja exibir no gr├ífico. As altera├º├Áes aparecem em tempo real.")
             series_frame = build_case_long_frame(selected_result, selected_monitors)
             if series_frame.empty:
-                st.warning("Nenhuma série numérica foi encontrada para este cenário.")
+                st.warning("Nenhuma s├®rie num├®rica foi encontrada para este cen├írio.")
             else:
                 series_options = list(series_frame["series"].dropna().unique())
                 selected_series = []
@@ -945,7 +1120,7 @@ else:
 
                 chart_frame = build_case_chart_frame(selected_result, selected_monitors, selected_series)
                 if chart_frame.empty:
-                    st.info("Selecione pelo menos uma série para exibir o gráfico.")
+                    st.info("Selecione pelo menos uma s├®rie para exibir o gr├ífico.")
                 else:
                     fig_series = go.Figure()
                     for column in chart_frame.columns:
@@ -957,7 +1132,7 @@ else:
                             line=dict(width=2)
                         ))
                     fig_series.update_layout(
-                        title=f"Séries do Cenário {selected_case}",
+                        title=f"S├®ries do Cen├írio {selected_case}",
                         xaxis_title="Hora",
                         yaxis_title="Valor",
                         hovermode="x unified",
@@ -971,26 +1146,26 @@ else:
             for monitor in selected_monitors:
                 frame = pick_monitor_values(data_map, monitor)
                 if frame is None or frame.empty:
-                    st.warning(f"Monitor {monitor} não retornou dados neste cenário.")
+                    st.warning(f"Monitor {monitor} n├úo retornou dados neste cen├írio.")
                     continue
                 frame = add_voltage_max_column(frame)
                 st.write(f"Monitor: {monitor}")
                 st.dataframe(frame, use_container_width=True)
-            st.caption(f"Monitores disponíveis: {', '.join(selected_result.get('monitors', []))}")
+            st.caption(f"Monitores dispon├¡veis: {', '.join(selected_result.get('monitors', []))}")
 
-st.subheader("Média e intervalo de confiança")
+st.subheader("M├®dia e intervalo de confian├ºa")
 ci_monitor = st.selectbox(
-    "Monitor para média",
+    "Monitor para m├®dia",
     options=selected_monitors,
     index=0,
     key="ci_monitor",
 )
 ci_frame = build_monitor_ci_frame(results, ci_monitor)
 if ci_frame.empty:
-    st.warning("Não há dados suficientes para calcular a média e o intervalo de confiança.")
+    st.warning("N├úo h├í dados suficientes para calcular a m├®dia e o intervalo de confian├ºa.")
 else:
     fig_ci = go.Figure()
-    # Banda de confiança (intervalo de confiança)
+    # Banda de confian├ºa (intervalo de confian├ºa)
     fig_ci.add_trace(go.Scatter(
         x=ci_frame["iteracao"],
         y=ci_frame["ci_upper"],
@@ -1009,19 +1184,19 @@ else:
         name="IC 95%",
         hoverinfo="skip"
     ))
-    # Linha de média
+    # Linha de m├®dia
     fig_ci.add_trace(go.Scatter(
         x=ci_frame["iteracao"],
         y=ci_frame["media"],
         mode="lines+markers",
-        name="Média",
+        name="M├®dia",
         line=dict(color="#1f4f7a", width=3),
         marker=dict(size=4)
     ))
     fig_ci.update_layout(
-        title=f"Média e Intervalo de Confiança - {ci_monitor}",
-        xaxis_title="Iterações",
-        yaxis_title="Tensão (pu)",
+        title=f"M├®dia e Intervalo de Confian├ºa - {ci_monitor}",
+        xaxis_title="Itera├º├Áes",
+        yaxis_title="Tens├úo (pu)",
         hovermode="x unified",
         height=450,
         template="plotly_white",
@@ -1029,147 +1204,117 @@ else:
     )
     st.plotly_chart(fig_ci, use_container_width=True)
 
-st.subheader("Média acumulada da tensão máxima")
-st.caption("Mostra a média acumulada da tensão máxima calculada em cada iteração para visualizar a convergência do Monte Carlo.")
-cumulative_voltage_frame = build_cumulative_voltage_frame(results, selected_monitors)
-if cumulative_voltage_frame.empty:
-    st.warning("Não há dados suficientes para calcular a média acumulada da tensão máxima.")
-else:
-    cumulative_col, boxplot_col = st.columns([2, 1])
-
-    with cumulative_col:
-        fig_cumulative = go.Figure()
-        fig_cumulative.add_trace(go.Scatter(
-            x=cumulative_voltage_frame["case"],
-            y=cumulative_voltage_frame["media_tensao_maxima"],
-            mode="lines+markers",
-            name="Média por iteração",
-            line=dict(color="#8bc34a", width=2, dash="dot"),
-            marker=dict(size=6),
-        ))
-        fig_cumulative.add_trace(go.Scatter(
-            x=cumulative_voltage_frame["case"],
-            y=cumulative_voltage_frame["media_acumulada"],
-            mode="lines+markers",
-            name="Média acumulada",
-            line=dict(color="#1f4f7a", width=3),
-            marker=dict(size=7),
-        ))
-        fig_cumulative.update_layout(
-            title="Média acumulada da tensão máxima por iteração",
-            xaxis_title="Iteração",
-            yaxis_title="Tensão máxima média (pu)",
-            hovermode="x unified",
-            height=450,
-            template="plotly_white",
-            margin=dict(l=50, r=50, t=80, b=50),
-        )
-        st.plotly_chart(fig_cumulative, use_container_width=True)
-
-    with boxplot_col:
-        fig_boxplot = go.Figure()
-        fig_boxplot.add_trace(go.Box(
-            y=cumulative_voltage_frame["media_tensao_maxima"],
-            name="Por iteração",
-            boxpoints="all",
-            jitter=0.35,
-            pointpos=-1.8,
-            marker=dict(color="#1f77b4", size=6, opacity=0.7),
-            line=dict(color="#1f77b4"),
-        ))
-        fig_boxplot.update_layout(
-            title="Distribuição da média da tensão máxima",
-            yaxis_title="Tensão máxima média (pu)",
-            height=450,
-            template="plotly_white",
-            margin=dict(l=50, r=30, t=80, b=50),
-        )
-        st.plotly_chart(fig_boxplot, use_container_width=True)
-
-st.subheader("Convergência dos monitores")
-st.caption("Mostra o valor médio de cada variável dos monitores ao longo das iterações para visualizar a convergência.")
-try:
-    convergence_frame = build_monitor_convergence_frame(results, selected_monitors)
-    if convergence_frame.empty:
-        st.warning("Não há dados suficientes para calcular a convergência dos monitores.")
+if benchmark_option == "Benchmark incremental":
+    st.subheader("Média acumulada da tensão máxima")
+    st.caption(
+        "Para cada iteração, calcula a média diária da tensão máxima e acumula os resultados para mostrar a evolução do benchmark incremental."
+    )
+    cumulative_voltage_frame = build_cumulative_voltage_frame(results, selected_monitors)
+    if cumulative_voltage_frame.empty:
+        st.warning("Não há dados suficientes para calcular a média acumulada da tensão máxima.")
     else:
-        # Get available monitors and variables in the convergence frame
-        available_monitors_conv = sorted(convergence_frame["monitor"].unique())
-        
-        # Seletor de monitores para o gráfico de convergência
-        col1, col2 = st.columns(2)
-        with col1:
-            selected_convergence_monitors = st.multiselect(
-                "Selecione monitores",
-                options=available_monitors_conv,
-                default=available_monitors_conv[:min(2, len(available_monitors_conv))],
-                key="convergence_monitors_select"
-            )
-        
-        if not selected_convergence_monitors:
-            st.warning("Selecione pelo menos um monitor para visualizar a convergência.")
-        else:
-            # Filter convergence data by selected monitors
-            filtered_by_monitor = convergence_frame[convergence_frame["monitor"].isin(selected_convergence_monitors)]
-            available_vars = sorted(filtered_by_monitor["variavel"].unique())
-            
-            with col2:
-                selected_vars = st.multiselect(
-                    "Selecione variáveis",
-                    options=available_vars,
-                    default=available_vars[:min(5, len(available_vars))],
-                    key="convergence_vars_select"
+        final_row = cumulative_voltage_frame.iloc[-1]
+        metric_cols = st.columns(4)
+        metric_cols[0].metric("Média acumulada final", f"{final_row['media_acumulada']:.6f}")
+        metric_cols[1].metric("Desvio padrão", f"{final_row['desvio_padrao_acumulado']:.6f}")
+        metric_cols[2].metric(
+            "IC 95%",
+            f"{final_row['ci_lower_acumulado']:.6f} a {final_row['ci_upper_acumulado']:.6f}",
+        )
+        metric_cols[3].metric("Iterações", f"{int(final_row['case'])}")
+
+        cumulative_col, boxplot_col = st.columns([2, 1])
+
+        with cumulative_col:
+            fig_cumulative = go.Figure()
+            fig_cumulative.add_trace(
+                go.Scatter(
+                    x=cumulative_voltage_frame["case"],
+                    y=cumulative_voltage_frame["media_tensao_maxima"],
+                    mode="lines+markers",
+                    name="Média por iteração",
+                    line=dict(color="#8bc34a", width=2, dash="dot"),
+                    marker=dict(size=6),
                 )
-            
-            if not selected_vars:
-                st.warning("Selecione pelo menos uma variável para visualizar a convergência.")
-            else:
-                # Filter convergence data by selected variables
-                filtered_convergence = filtered_by_monitor[filtered_by_monitor["variavel"].isin(selected_vars)]
-                
-                if filtered_convergence.empty:
-                    st.warning("Nenhum dado de convergência disponível para as seleções realizadas.")
-                else:
-                    fig_convergence = go.Figure()
-                    colors = px.colors.qualitative.Plotly
-                    
-                    # Get unique combinations of monitor and variavel
-                    unique_combinations = filtered_convergence[["monitor", "variavel"]].drop_duplicates().values.tolist()
-                    
-                    for idx, (monitor, var) in enumerate(unique_combinations):
-                        var_data = filtered_convergence[(filtered_convergence["monitor"] == monitor) & (filtered_convergence["variavel"] == var)]
-                        if var_data.empty:
-                            continue
-                        
-                        color = colors[idx % len(colors)]
-                        label = f"{monitor} - {var}"
-                        
-                        fig_convergence.add_trace(go.Scatter(
-                            x=var_data["iteracao"].values,
-                            y=var_data["media"].values,
-                            mode="lines+markers",
-                            name=label,
-                            line=dict(color=color, width=2.5),
-                            marker=dict(size=5),
-                            hovertemplate="<b>%{fullData.name}</b><br>Iteração: %{x}<br>Média: %{y:.6f}<br>Min: %{customdata[0]:.6f}<br>Max: %{customdata[1]:.6f}<br>Desvio: %{customdata[2]:.6f}<extra></extra>",
-                            customdata=var_data[["min", "max", "std"]].values
-                        ))
-                    
-                    if len(fig_convergence.data) > 0:
-                        fig_convergence.update_layout(
-                            title="Convergência das Variáveis dos Monitores ao Longo das Iterações",
-                            xaxis_title="Iterações",
-                            yaxis_title="Valor médio",
-                            hovermode="x unified",
-                            height=550,
-                            template="plotly_white",
-                            margin=dict(l=70, r=70, t=100, b=70),
-                            legend=dict(x=1.02, y=1, xanchor="left", yanchor="top", bgcolor="rgba(255, 255, 255, 0.8)"),
-                        )
-                        st.plotly_chart(fig_convergence, use_container_width=True)
-                    else:
-                        st.warning("Nenhuma série foi adicionada ao gráfico.")
-except Exception as e:
-    st.error(f"Erro ao gerar gráfico de convergência: {type(e).__name__}: {str(e)}")
-    import traceback
-    st.error(traceback.format_exc())
+            )
+            fig_cumulative.add_trace(
+                go.Scatter(
+                    x=cumulative_voltage_frame["case"],
+                    y=cumulative_voltage_frame["media_acumulada"],
+                    mode="lines+markers",
+                    name="Média acumulada",
+                    line=dict(color="#1f4f7a", width=3),
+                    marker=dict(size=7),
+                )
+            )
+            fig_cumulative.add_trace(
+                go.Scatter(
+                    x=cumulative_voltage_frame["case"],
+                    y=cumulative_voltage_frame["ci_upper_acumulado"],
+                    mode="lines",
+                    line=dict(width=0),
+                    showlegend=False,
+                    hoverinfo="skip",
+                )
+            )
+            fig_cumulative.add_trace(
+                go.Scatter(
+                    x=cumulative_voltage_frame["case"],
+                    y=cumulative_voltage_frame["ci_lower_acumulado"],
+                    mode="lines",
+                    line=dict(width=0),
+                    fillcolor="rgba(31, 79, 122, 0.18)",
+                    fill="tonexty",
+                    name="IC 95% acumulado",
+                    hoverinfo="skip",
+                )
+            )
+            fig_cumulative.update_layout(
+                title="Média acumulada da tensão máxima por iteração",
+                xaxis_title="Iteração",
+                yaxis_title="Tensão máxima média (pu)",
+                hovermode="x unified",
+                height=450,
+                template="plotly_white",
+                margin=dict(l=50, r=50, t=80, b=50),
+            )
+            st.plotly_chart(fig_cumulative, use_container_width=True)
+            st.dataframe(
+                cumulative_voltage_frame[
+                    [
+                        "case",
+                        "amostras",
+                        "media_tensao_maxima",
+                        "desvio_padrao",
+                        "ci_lower",
+                        "ci_upper",
+                        "media_acumulada",
+                        "desvio_padrao_acumulado",
+                        "ci_lower_acumulado",
+                        "ci_upper_acumulado",
+                    ]
+                ],
+                use_container_width=True,
+            )
+
+        with boxplot_col:
+            fig_boxplot = go.Figure()
+            fig_boxplot.add_trace(
+                go.Box(
+                    y=cumulative_voltage_frame["media_tensao_maxima"],
+                    name="Por iteração",
+                    boxpoints="all",
+                    jitter=0.35,
+                    pointpos=-1.8,
+                    marker=dict(color="#1f77b4", size=6, opacity=0.7),
+                    line=dict(color="#1f77b4"),
+                )
+            )
+            fig_boxplot.update_layout(
+                title="Distribuição da média da tensão máxima",
+                yaxis_title="Tensão máxima média (pu)",
+                height=450,
+                template="plotly_white",
+                margin=dict(l=50, r=30, t=80, b=50),
+            )
+            st.plotly_chart(fig_boxplot, use_container_width=True)
