@@ -486,6 +486,34 @@ def randomize_value(base_value: float, threshold_pct: float, rng: random.Random)
     return base_value * (1 + delta)
 
 
+def apply_delta(base_value: float, delta: float) -> float:
+    return base_value * (1 + delta)
+
+
+def selection_group_key(selection: dict) -> str:
+    group = str(selection.get("offset_group") or "").strip()
+    if group:
+        return f"group::{group.casefold()}"
+    relative_path = str(selection.get("relative_path") or "")
+    selection_id = str(selection.get("id") or selection.get("name") or "")
+    return f"selection::{relative_path}::{selection_id}"
+
+
+def build_shared_deltas(selections: list, scenario_idx: int, base_seed: int | None = None) -> dict[str, float]:
+    grouped_thresholds: dict[str, float] = {}
+    for selection in selections:
+        group_key = selection_group_key(selection)
+        threshold_pct = float(selection.get("threshold_pct", 0.0))
+        if group_key not in grouped_thresholds:
+            grouped_thresholds[group_key] = threshold_pct
+    shared_deltas: dict[str, float] = {}
+    for group_key, threshold_pct in grouped_thresholds.items():
+        seed_material = f"{group_key}-{scenario_idx}-{base_seed}" if base_seed is not None else f"{group_key}-{scenario_idx}"
+        rng = random.Random(seed_material)
+        shared_deltas[group_key] = rng.uniform(-threshold_pct, threshold_pct) / 100.0
+    return shared_deltas
+
+
 def replace_key_value(text: str, selection: dict, rng: random.Random) -> str:
     key = selection["name"]
     occurrence = selection.get("match_index", 0)
@@ -513,23 +541,68 @@ def replace_line_value(text: str, selection: dict, rng: random.Random) -> str:
     return "\n".join(lines)
 
 
-def apply_randomizations_for_file(file_path: Path, selections: list, scenario_idx: int, base_seed: int | None = None):
+def replace_key_value_with_delta(text: str, selection: dict, delta: float) -> str:
+    key = selection["name"]
+    occurrence = selection.get("match_index", 0)
+    pattern = re.compile(rf"(?i)({re.escape(key)})\s*=\s*([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)")
+    matches = list(pattern.finditer(text))
+    if occurrence >= len(matches):
+        return text
+    match = matches[occurrence]
+    new_val = apply_delta(selection["value"], delta)
+    return text[: match.start(2)] + f"{new_val:.6f}" + text[match.end(2) :]
+
+
+def replace_line_value_with_delta(text: str, selection: dict, delta: float) -> str:
+    lines = text.splitlines()
+    idx = selection.get("line", 1) - 1
+    if idx < 0 or idx >= len(lines):
+        return text
+    new_val = apply_delta(selection["value"], delta)
+    lines[idx] = re.sub(
+        r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?",
+        f"{new_val:.6f}",
+        lines[idx],
+        count=1,
+    )
+    return "\n".join(lines)
+
+
+def apply_randomizations_for_file(
+    file_path: Path,
+    selections: list,
+    scenario_idx: int,
+    base_seed: int | None = None,
+    shared_deltas: dict[str, float] | None = None,
+):
     if not selections:
         return
     text = file_path.read_text(encoding="utf-8", errors="ignore")
-    seed_material = f"{file_path}-{scenario_idx}-{base_seed}" if base_seed is not None else f"{file_path}-{scenario_idx}"
-    rng = random.Random(seed_material)
     for selection in selections:
+        group_key = selection_group_key(selection)
+        delta = None if shared_deltas is None else shared_deltas.get(group_key)
         if selection.get("kind") == "line_value":
-            text = replace_line_value(text, selection, rng)
+            if delta is None:
+                seed_material = f"{file_path}-{scenario_idx}-{base_seed}" if base_seed is not None else f"{file_path}-{scenario_idx}"
+                rng = random.Random(seed_material)
+                text = replace_line_value(text, selection, rng)
+            else:
+                text = replace_line_value_with_delta(text, selection, delta)
         else:
-            text = replace_key_value(text, selection, rng)
+            if delta is None:
+                seed_material = f"{file_path}-{scenario_idx}-{base_seed}" if base_seed is not None else f"{file_path}-{scenario_idx}"
+                rng = random.Random(seed_material)
+                text = replace_key_value(text, selection, rng)
+            else:
+                text = replace_key_value_with_delta(text, selection, delta)
     file_path.write_text(text, encoding="utf-8")
 
 
 def prepare_randomized_dir(extract_dir: Path, selections: list, scenario_idx: int, base_seed: int | None = None) -> Path:
     scenario_dir = Path(tempfile.mkdtemp(prefix=f"scenario_{scenario_idx}_"))
     shutil.copytree(extract_dir, scenario_dir, dirs_exist_ok=True)
+
+    shared_deltas = build_shared_deltas(selections, scenario_idx, base_seed)
 
     grouped = {}
     for sel in selections:
@@ -538,7 +611,7 @@ def prepare_randomized_dir(extract_dir: Path, selections: list, scenario_idx: in
     for rel_path, vars_for_file in grouped.items():
         target = scenario_dir / rel_path
         if target.exists():
-            apply_randomizations_for_file(target, vars_for_file, scenario_idx, base_seed)
+            apply_randomizations_for_file(target, vars_for_file, scenario_idx, base_seed, shared_deltas)
 
     return scenario_dir
 
@@ -674,6 +747,7 @@ DEFAULT_SESSION_STATE = {
     "pending_main_file": None,
     "pending_extract_dir": None,
     "pending_random_plan": [],
+    "pending_random_grouped_plan": {},
     "pending_case_count": 1,
     "pending_selected_monitors": [],
     "pending_monitor_offsets": {},
@@ -699,6 +773,7 @@ for key, default in DEFAULT_SESSION_STATE.items():
 main_file = st.session_state["pending_main_file"]
 extract_dir = st.session_state["pending_extract_dir"]
 random_plan = st.session_state.get("pending_random_plan", [])
+grouped_random_plan = st.session_state.get("pending_random_grouped_plan", {})
 case_count = int(st.session_state.get("pending_case_count", 1))
 stored_selected_monitors = st.session_state.get("pending_selected_monitors", [])
 stored_monitor_offsets = st.session_state.get("pending_monitor_offsets", {})
@@ -712,6 +787,15 @@ if not all([main_file, extract_dir]):
 if not random_plan:
     st.warning("Nenhum plano de randomização foi enviado. Volte e selecione as vari├íveis.")
     st.stop()
+
+if grouped_random_plan:
+    grouped_info = []
+    for group_key, items in grouped_random_plan.items():
+        if len(items) > 1:
+            display_names = ", ".join(item["name"] for item in items)
+            grouped_info.append(f"{group_key}: {display_names}")
+    if grouped_info:
+        st.caption("Grupos com offset compartilhado: " + " | ".join(grouped_info))
 
 st.write("Carregando...")
 st.write(f"- Arquivo principal: {main_file}")

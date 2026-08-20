@@ -210,8 +210,20 @@ for idx, (title, desc) in enumerate(features.items()):
                                 value=10.0,
                                 key=f"thr_{safe_key}",
                             )
+                            group_label = st.text_input(
+                                "Grupo de offset (opcional)",
+                                value="",
+                                key=f"grp_{safe_key}",
+                                help="Use o mesmo nome em variáveis que devem receber a mesma variação percentual.",
+                            )
                             if checked:
-                                selected_plan.append({**var, "threshold_pct": threshold})
+                                selected_plan.append(
+                                    {
+                                        **var,
+                                        "threshold_pct": threshold,
+                                        "offset_group": group_label.strip() or None,
+                                    }
+                                )
                         st.divider()
 
                     if st.button("Gerar casos e carregar", key=f"redirect_loading_{idx}"):
@@ -221,10 +233,25 @@ for idx, (title, desc) in enumerate(features.items()):
                             if not selected_plan:
                                 raise ValueError("Selecione pelo menos uma variável para randomizar.")
 
+                            grouped_plan: dict[str, list[dict]] = {}
+                            for selection in selected_plan:
+                                group_key = selection.get("offset_group") or selection["id"]
+                                grouped_plan.setdefault(group_key, []).append(selection)
+
+                            for group_key, items in grouped_plan.items():
+                                if len(items) < 2:
+                                    continue
+                                thresholds = {round(float(item["threshold_pct"]), 12) for item in items}
+                                if len(thresholds) > 1:
+                                    raise ValueError(
+                                        f"O grupo '{group_key}' precisa usar o mesmo limite de aleatoriedade em todas as variáveis."
+                                    )
+
                             st.session_state["pending_main_file"] = main_file
                             st.session_state["pending_extract_dir"] = str(extract_dir)
                             st.session_state["pending_random_plan"] = selected_plan
                             st.session_state["pending_case_count"] = int(case_count)
+                            st.session_state["pending_random_grouped_plan"] = grouped_plan
                             st.switch_page("pages/loading.py")
                         except Exception as exc:
                             st.error(f"Erro : {exc}")
