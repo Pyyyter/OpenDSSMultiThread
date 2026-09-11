@@ -804,12 +804,14 @@ st.write(f"- Casos em paralelo: {case_count}")
 
 benchmark_options = ["Normal", "Benchmark (serial + paralelo)", "Benchmark incremental"]
 stored_benchmark_option = st.session_state.get("last_benchmark_option")
+st.session_state.setdefault(
+    "benchmark_option",
+    stored_benchmark_option if stored_benchmark_option in benchmark_options else benchmark_options[0],
+)
 benchmark_option = st.selectbox(
     "Modo de execução",
     options=benchmark_options,
-    index=benchmark_options.index(stored_benchmark_option)
-    if stored_benchmark_option in benchmark_options
-    else 0,
+    key="benchmark_option",
 )
 benchmark_mode = benchmark_option != "Normal"
 incremental_workers = None
